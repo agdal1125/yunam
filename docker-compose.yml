@@ -1,0 +1,6 @@
+services:
+  gateway:
+    build: ./gateway
+    container_name: yunam-gateway
+    restart: unless-stopped
+    env_file: .env
