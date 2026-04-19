@@ -1,14 +1,23 @@
-"""Yunam gateway — Telegram long-polling echo bot (Phase 0-7).
+"""Yunam gateway — entrypoint.
 
-Only replies to messages from TELEGRAM_ALLOWED_USER_ID. Every other
-sender is silently ignored (logged at WARNING).
+Wires the Telegram long-polling gateway to the Yunam orchestrator. The allowlist
+on TELEGRAM_ALLOWED_USER_ID is the gate; unauthorized users are silently ignored
+and logged at WARNING.
+
+Uses the manual PTB lifecycle (initialize/start/start_polling/stop/shutdown)
+rather than `app.run_polling()` so aiosqlite opens/closes in the same asyncio
+event loop.
 """
 
+from __future__ import annotations
+
+import asyncio
 import logging
-import os
+import signal
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -17,27 +26,26 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
+import anthropic
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-# Quiet down python-telegram-bot's noisy HTTP layer
-logging.getLogger("httpx").setLevel(logging.WARNING)
+from yunam.config import Config, configure_logging, load_config
+from yunam.orchestrator import Orchestrator
+from yunam.sessions import SessionStore
+from yunam.tools.obsidian import ObsidianTools
+
+load_dotenv()
+configure_logging()
 logger = logging.getLogger("yunam.gateway")
 
-# Fail fast on missing config — KeyError beats a bot that silently answers nobody.
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-ALLOWED_USER_ID = int(os.environ["TELEGRAM_ALLOWED_USER_ID"])
+TELEGRAM_MSG_LIMIT = 4096
 
 
-def _is_authorized(update: Update) -> bool:
+def _is_authorized(update: Update, allowed_user_id: int) -> bool:
     user = update.effective_user
     if user is None:
         logger.warning("update with no effective_user: %s", update.update_id)
         return False
-    if user.id != ALLOWED_USER_ID:
+    if user.id != allowed_user_id:
         logger.warning(
             "unauthorized access: user_id=%s username=%s",
             user.id,
@@ -48,27 +56,100 @@ def _is_authorized(update: Update) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(update):
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_authorized(update, cfg.allowed_user_id):
         return
     logger.info("/start from user_id=%s", update.effective_user.id)
-    await update.message.reply_text("Yunam online")
+    await update.message.reply_text(
+        "Yunam online. I have access to your Obsidian vault — ask me anything."
+    )
 
 
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_authorized(update):
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_authorized(update, cfg.allowed_user_id):
         return
-    text = update.message.text or ""
-    logger.info("echo to user_id=%s: %r", update.effective_user.id, text)
-    await update.message.reply_text(text)
+
+    chat_id = update.effective_chat.id
+    user_text = update.message.text or ""
+    logger.info("turn start chat_id=%s len=%d", chat_id, len(user_text))
+
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except Exception:
+        # A typing indicator failure should not abort the turn.
+        logger.debug("send_chat_action failed", exc_info=True)
+
+    orch: Orchestrator = context.application.bot_data["orch"]
+    try:
+        response = await orch.handle_turn(chat_id, user_text)
+    except Exception:
+        logger.exception("orchestrator failure chat_id=%s", chat_id)
+        response = "Sorry — something went wrong on my end. Check the logs."
+
+    await update.message.reply_text(response[:TELEGRAM_MSG_LIMIT])
+
+
+async def _run() -> None:
+    cfg = load_config()
+    logger.info(
+        "gateway starting; allowlist user_id=%s vault=%s db=%s",
+        cfg.allowed_user_id,
+        cfg.vault_path,
+        cfg.db_path,
+    )
+
+    store = await SessionStore.open(cfg.db_path)
+    tools = ObsidianTools(cfg.vault_path)
+    claude_client = anthropic.AsyncAnthropic(api_key=cfg.anthropic_api_key)
+    orch = Orchestrator(claude_client, store, tools)
+
+    app = Application.builder().token(cfg.telegram_token).build()
+    app.bot_data["cfg"] = cfg
+    app.bot_data["orch"] = orch
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+
+    stop_event = asyncio.Event()
+
+    def _on_signal(sig_name: str) -> None:
+        logger.info("signal %s received; shutting down", sig_name)
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _on_signal, sig.name)
+        except NotImplementedError:
+            # Signal handlers aren't available on Windows; fine to skip.
+            pass
+
+    try:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("gateway running")
+        await stop_event.wait()
+    finally:
+        logger.info("gateway stopping")
+        try:
+            await app.updater.stop()
+        except Exception:
+            logger.exception("error stopping updater")
+        try:
+            await app.stop()
+        except Exception:
+            logger.exception("error stopping application")
+        try:
+            await app.shutdown()
+        except Exception:
+            logger.exception("error during shutdown")
+        await store.close()
+        logger.info("gateway stopped cleanly")
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-
-    logger.info("gateway starting; allowlist user_id=%s", ALLOWED_USER_ID)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    asyncio.run(_run())
 
 
 if __name__ == "__main__":

@@ -4,3 +4,14 @@ services:
     container_name: yunam-gateway
     restart: unless-stopped
     env_file: .env
+    volumes:
+      # Obsidian vault — read/write. Host path overridable via YUNAM_VAULT_PATH_HOST
+      # (defaults to ~/obsidian). Must be a pre-existing directory on the host.
+      - ${YUNAM_VAULT_PATH_HOST:-~/obsidian}:/data/obsidian:rw
+      # SQLite session store — bind-mounted so you can inspect with `sqlite3 ./data/yunam/yunam.db`.
+      - ./data/yunam:/data/yunam:rw
+    environment:
+      - YUNAM_VAULT_PATH=/data/obsidian
+      - YUNAM_DB_PATH=/data/yunam/yunam.db
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}

@@ -24,6 +24,12 @@ dist/
 *.log
 logs/
 
+# Phase 1: SQLite host dir + local dev artifacts
+data/
+dev-vault/
+dev-yunam.db
+dev-yunam.db-*
+
 # macOS
 .DS_Store
 .AppleDouble
