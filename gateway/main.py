@@ -29,10 +29,13 @@ from telegram.ext import (
 import anthropic
 
 from yunam.config import Config, configure_logging, load_config
+from yunam.embeddings import VoyageEmbedder
 from yunam.orchestrator import Orchestrator
 from yunam.prompts import DAILY_PROMPT_TEMPLATE
 from yunam.scheduler import run_daily_scheduler
+from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
+from yunam.tools.attachments import AttachmentTools
 from yunam.tools.obsidian import ObsidianTools
 
 load_dotenv()
@@ -67,6 +70,176 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def _extract_attachment(message) -> dict | None:
+    """Return a kind/file_id/metadata dict for the attachment on `message`, or None.
+
+    Photos are delivered as an array of sizes; we use the largest. Everything
+    else has a single nested object. Order reflects Telegram's priorities.
+    """
+    if message.photo:
+        largest = message.photo[-1]
+        return {
+            "kind": "photo",
+            "file_id": largest.file_id,
+            "file_unique_id": largest.file_unique_id,
+            "file_name": None,
+            "mime_type": "image/jpeg",
+            "file_size": largest.file_size,
+        }
+    if message.document:
+        d = message.document
+        return {
+            "kind": "document",
+            "file_id": d.file_id,
+            "file_unique_id": d.file_unique_id,
+            "file_name": d.file_name,
+            "mime_type": d.mime_type,
+            "file_size": d.file_size,
+        }
+    if message.video:
+        v = message.video
+        return {
+            "kind": "video",
+            "file_id": v.file_id,
+            "file_unique_id": v.file_unique_id,
+            "file_name": v.file_name,
+            "mime_type": v.mime_type,
+            "file_size": v.file_size,
+        }
+    if message.animation:
+        a = message.animation
+        return {
+            "kind": "animation",
+            "file_id": a.file_id,
+            "file_unique_id": a.file_unique_id,
+            "file_name": a.file_name,
+            "mime_type": a.mime_type,
+            "file_size": a.file_size,
+        }
+    if message.voice:
+        v = message.voice
+        return {
+            "kind": "voice",
+            "file_id": v.file_id,
+            "file_unique_id": v.file_unique_id,
+            "file_name": None,
+            "mime_type": v.mime_type or "audio/ogg",
+            "file_size": v.file_size,
+        }
+    if message.audio:
+        a = message.audio
+        return {
+            "kind": "audio",
+            "file_id": a.file_id,
+            "file_unique_id": a.file_unique_id,
+            "file_name": a.file_name,
+            "mime_type": a.mime_type,
+            "file_size": a.file_size,
+        }
+    return None
+
+
+async def on_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Record an incoming attachment. Saves immediately if caption starts with /save."""
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_authorized(update, cfg.allowed_user_id):
+        return
+
+    message = update.message
+    if message is None:
+        return
+    meta = _extract_attachment(message)
+    if meta is None:
+        return
+
+    chat_id = update.effective_chat.id
+    caption = message.caption
+    store: SessionStore = context.application.bot_data["store"]
+
+    # Always stash in `pending_attachments` — cheap, defers download until /save.
+    pending_id = await store.add_pending_attachment(
+        chat_id=chat_id,
+        file_id=meta["file_id"],
+        file_unique_id=meta["file_unique_id"],
+        kind=meta["kind"],
+        file_name=meta["file_name"],
+        mime_type=meta["mime_type"],
+        file_size=meta["file_size"],
+        caption=caption,
+    )
+    logger.info(
+        "attachment received chat_id=%s kind=%s file_id=%s name=%s size=%s pending_id=%s",
+        chat_id,
+        meta["kind"],
+        meta["file_id"][:16] + "...",
+        meta["file_name"],
+        meta["file_size"],
+        pending_id,
+    )
+
+    # Fast path: `/save` in caption → commit immediately without going through the agent.
+    inline_save = bool(caption) and caption.strip().lower().startswith("/save")
+    if inline_save:
+        await _commit_and_reply(update, context, caption_override=_strip_save_prefix(caption))
+        return
+
+    await message.reply_text(
+        "📎 got it. Send /save to keep this, or describe what to do with it."
+    )
+
+
+def _strip_save_prefix(caption: str | None) -> str | None:
+    """Return the caption with the leading `/save` command stripped, or None if empty."""
+    if caption is None:
+        return None
+    stripped = caption.strip()
+    if not stripped.lower().startswith("/save"):
+        return caption
+    remainder = stripped[len("/save"):].lstrip()
+    return remainder or None
+
+
+async def _commit_and_reply(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    caption_override: str | None = None,
+) -> None:
+    chat_id = update.effective_chat.id
+    attachments: AttachmentTools | None = context.application.bot_data.get("attachments")
+    if attachments is None:
+        await update.message.reply_text("attachments not configured on this server.")
+        return
+    try:
+        saved = await attachments.commit_pending(
+            chat_id=chat_id, caption_override=caption_override
+        )
+    except Exception:
+        logger.exception("commit_pending failed chat_id=%s", chat_id)
+        await update.message.reply_text("save failed — check the logs.")
+        return
+    if saved is None:
+        await update.message.reply_text(
+            "no recent attachment to save. Send a file first, then /save."
+        )
+        return
+    await update.message.reply_text(
+        f"✅ saved: {saved.relpath} ({saved.file_size or 0} bytes). indexed."
+    )
+
+
+async def on_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle `/save` typed as its own message (no attachment in this message)."""
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_authorized(update, cfg.allowed_user_id):
+        return
+    # If /save was attached to a file, `on_attachment` already handled it — this
+    # path is only for "/save" typed on its own or with text args.
+    text = (update.message.text or "").strip()
+    remainder = text[len("/save"):].lstrip() if text.lower().startswith("/save") else None
+    await _commit_and_reply(update, context, caption_override=remainder or None)
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     if not _is_authorized(update, cfg.allowed_user_id):
@@ -95,21 +268,49 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _run() -> None:
     cfg = load_config()
     logger.info(
-        "gateway starting; allowlist user_id=%s vault=%s db=%s",
+        "gateway starting; allowlist user_id=%s vault=%s filevault=%s db=%s",
         cfg.allowed_user_id,
         cfg.vault_path,
+        cfg.filevault_path,
         cfg.db_path,
     )
 
     store = await SessionStore.open(cfg.db_path)
     tools = ObsidianTools(cfg.vault_path)
     claude_client = anthropic.AsyncAnthropic(api_key=cfg.anthropic_api_key)
-    orch = Orchestrator(claude_client, store, tools, timezone=cfg.timezone)
+    embedder = VoyageEmbedder(api_key=cfg.voyage_api_key)
 
     app = Application.builder().token(cfg.telegram_token).build()
+    sender = PTBSender(app.bot)
+    attachments = AttachmentTools(
+        store=store,
+        filevault_root=cfg.filevault_path,
+        obsidian_root=cfg.vault_path,
+        sender=sender,
+        embedder=embedder,
+        timezone=cfg.timezone,
+    )
+    orch = Orchestrator(
+        claude_client, store, tools, attachments=attachments, timezone=cfg.timezone
+    )
+
     app.bot_data["cfg"] = cfg
     app.bot_data["orch"] = orch
+    app.bot_data["store"] = store
+    app.bot_data["attachments"] = attachments
+
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("save", on_save))
+    # Attachment handlers — order doesn't matter, filters are disjoint.
+    attachment_filter = (
+        filters.PHOTO
+        | filters.Document.ALL
+        | filters.VIDEO
+        | filters.VOICE
+        | filters.AUDIO
+        | filters.ANIMATION
+    )
+    app.add_handler(MessageHandler(attachment_filter, on_attachment))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     stop_event = asyncio.Event()

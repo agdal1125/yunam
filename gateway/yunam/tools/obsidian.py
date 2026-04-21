@@ -1,6 +1,6 @@
 """Obsidian vault tools exposed to Claude.
 
-Four async tool functions + a module-level `TOOL_SCHEMAS` list (stable order — don't
+Four async tool functions + a module-level `OBSIDIAN_TOOL_SCHEMAS` list (stable order — don't
 rebuild dynamically; prompt caching depends on byte-identical prefixes across turns).
 
 All I/O wrapped in `asyncio.to_thread` so file reads/writes don't block the event loop.
@@ -25,7 +25,7 @@ MAX_LIST_ENTRIES = 500
 MAX_SEARCH_FILE_SIZE = 1_000_000  # skip giant files during search
 
 
-TOOL_SCHEMAS: list[dict[str, Any]] = [
+OBSIDIAN_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "vault_read",
         "description": (

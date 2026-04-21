@@ -17,7 +17,9 @@ class Config:
     telegram_token: str
     allowed_user_id: int
     anthropic_api_key: str
+    voyage_api_key: str
     vault_path: Path
+    filevault_path: Path
     db_path: Path
     timezone: str
     schedule_enabled: bool
@@ -42,6 +44,7 @@ def _parse_bool(value: str) -> bool:
 
 def load_config() -> Config:
     vault_path = Path(os.environ.get("YUNAM_VAULT_PATH", "/data/obsidian")).resolve()
+    filevault_path = Path(os.environ.get("YUNAM_FILEVAULT_PATH", "/data/filevault")).resolve()
     db_path = Path(os.environ.get("YUNAM_DB_PATH", "/data/yunam/yunam.db")).resolve()
     hour, minute = _parse_hhmm(os.environ.get("YUNAM_DAILY_REFLECTION_TIME", "22:30"))
 
@@ -49,7 +52,9 @@ def load_config() -> Config:
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         allowed_user_id=int(os.environ["TELEGRAM_ALLOWED_USER_ID"]),
         anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
+        voyage_api_key=os.environ["VOYAGE_API_KEY"],
         vault_path=vault_path,
+        filevault_path=filevault_path,
         db_path=db_path,
         timezone=os.environ.get("YUNAM_TIMEZONE", "Asia/Seoul"),
         schedule_enabled=_parse_bool(os.environ.get("YUNAM_SCHEDULE_ENABLED", "false")),

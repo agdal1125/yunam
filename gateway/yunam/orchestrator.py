@@ -19,7 +19,12 @@ from langgraph.graph import END, START, StateGraph
 
 from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
-from .tools.obsidian import TOOL_SCHEMAS, ObsidianTools
+from .tools.attachments import (
+    ATTACHMENT_TOOL_NAMES,
+    ATTACHMENT_TOOL_SCHEMAS,
+    AttachmentTools,
+)
+from .tools.obsidian import OBSIDIAN_TOOL_SCHEMAS, ObsidianTools
 from .tools.vault import VaultError
 
 logger = logging.getLogger("yunam.orchestrator")
@@ -85,11 +90,19 @@ class Orchestrator:
         claude_client: ClaudeClient,
         store: SessionStore,
         tools: ObsidianTools,
+        attachments: AttachmentTools | None = None,
         timezone: str = "Asia/Seoul",
     ):
         self._claude = claude_client
         self._store = store
         self._tools = tools
+        self._attachments = attachments
+        # Schemas are concatenated once at init — stable byte-identical ordering
+        # across turns is what prompt caching depends on.
+        if attachments is not None:
+            self._tool_schemas = list(OBSIDIAN_TOOL_SCHEMAS) + list(ATTACHMENT_TOOL_SCHEMAS)
+        else:
+            self._tool_schemas = list(OBSIDIAN_TOOL_SCHEMAS)
         self._tz = ZoneInfo(timezone)
         self._graph = self._build_graph()
 
@@ -146,7 +159,7 @@ class Orchestrator:
                 ],
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
-                tools=TOOL_SCHEMAS,
+                tools=self._tool_schemas,
                 messages=messages,
             )
             final_response = response
@@ -196,7 +209,16 @@ class Orchestrator:
                 t0 = time.monotonic()
                 is_error = False
                 try:
-                    result = await self._tools.dispatch(name, inputs)
+                    if name in ATTACHMENT_TOOL_NAMES:
+                        if self._attachments is None:
+                            raise VaultError(
+                                "attachment tools not available in this runtime"
+                            )
+                        result = await self._attachments.dispatch(
+                            name, inputs, chat_id=state["chat_id"]
+                        )
+                    else:
+                        result = await self._tools.dispatch(name, inputs)
                 except VaultError as e:
                     result = f"Tool error: {e}"
                     is_error = True
