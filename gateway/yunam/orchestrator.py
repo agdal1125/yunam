@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 from typing import Any, Protocol, TypedDict
+from zoneinfo import ZoneInfo
 
 from langgraph.graph import END, START, StateGraph
 
@@ -83,10 +85,12 @@ class Orchestrator:
         claude_client: ClaudeClient,
         store: SessionStore,
         tools: ObsidianTools,
+        timezone: str = "Asia/Seoul",
     ):
         self._claude = claude_client
         self._store = store
         self._tools = tools
+        self._tz = ZoneInfo(timezone)
         self._graph = self._build_graph()
 
     def _build_graph(self):
@@ -119,7 +123,12 @@ class Orchestrator:
 
     async def _agent_step_node(self, state: AgentState) -> dict[str, Any]:
         messages: list[dict[str, Any]] = list(state["history"])
-        messages.append({"role": "user", "content": state["user_text"]})
+        # Per-turn date context goes in the user message, never the system prompt —
+        # otherwise every day invalidates the cached prefix.
+        now_local = datetime.now(self._tz)
+        date_tag = now_local.strftime("%Y-%m-%d %H:%M %Z")
+        wrapped = f"[meta: now is {date_tag}]\n\n{state['user_text']}"
+        messages.append({"role": "user", "content": wrapped})
 
         tool_calls_log: list[ToolCall] = []
         final_response: Any = None

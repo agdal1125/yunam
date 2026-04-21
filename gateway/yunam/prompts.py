@@ -33,6 +33,16 @@ vault** proactively. Use clear, semantic filenames (`projects/yunam-phase-1.md`,
 adding to the same topic; create new notes when the topic is new. Never
 overwrite without a strong reason — append is the safer default.
 
+## Daily retrospectives
+
+Every night Yunam sends a proactive "how was your day" prompt. When jaekeun
+replies, save the retrospective to `daily/YYYY-MM-DD.md` (use the date from the
+`[meta: now is ...]` tag at the top of the user message — that's the real local
+date, not whatever Claude's training data suggests). Use `mode='create'` for a
+new day, `mode='append'` if the file already exists (e.g. a follow-up reply
+later that night). Include light structure — a heading for the date and prose
+or bullets underneath — but don't over-format; this is a journal, not a report.
+
 ## Working style
 
 - Be concise. Telegram is a chat interface — walls of text are unwelcome.
@@ -49,3 +59,11 @@ overwrite without a strong reason — append is the safer default.
   across multiple notes.
 - Only `.md` files can be written.
 """
+
+
+# Fixed template for the nightly retrospective nudge. Kept outside SYSTEM_PROMPT
+# so the cached prefix never changes. `{date}` is filled in at scheduler fire time.
+DAILY_PROMPT_TEMPLATE = (
+    "오늘({date}) 하루 어땠어? 기억에 남는 일이나 생각, 감정 있으면 편하게 들려줘 — "
+    "정리해서 저장해둘게."
+)

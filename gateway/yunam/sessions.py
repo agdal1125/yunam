@@ -108,6 +108,33 @@ class SessionStore:
             rows = await cursor.fetchall()
         return [{"role": role, "content": content} for role, content in rows]
 
+    async def record_proactive_message(self, chat_id: int, text: str) -> None:
+        """Record an assistant-initiated message (e.g. nightly retrospective prompt).
+
+        Writes the session row (upsert) and an `assistant` message, so the next
+        user reply's `load_history` sees Yunam's prompt as prior context.
+        """
+        db = self._conn
+        now = _now_iso()
+        await db.execute("BEGIN")
+        try:
+            await db.execute(
+                """
+                INSERT INTO sessions (chat_id, created_at, last_seen_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+                """,
+                (chat_id, now, now),
+            )
+            await db.execute(
+                "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
+                (chat_id, text, now),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
     async def persist_turn(
         self,
         chat_id: int,
