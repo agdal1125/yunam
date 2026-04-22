@@ -46,7 +46,13 @@ services:
       - HOST=0.0.0.0          # 0.0.0.0 so the gateway container can reach it via docker network
       - PORT=3000
       - GOOGLE_OAUTH_CREDENTIALS=/app/gcp-oauth.keys.json
-      - GOOGLE_CALENDAR_MCP_TOKEN_PATH=/home/nodejs/.config/google-calendar-mcp
+      # GOOGLE_CALENDAR_MCP_TOKEN_PATH is NOT set — nspady's default resolves
+      # to $HOME/.config/google-calendar-mcp/tokens.json inside the container
+      # (i.e. /home/nodejs/.config/google-calendar-mcp/tokens.json), which
+      # lands inside the `calendar-tokens` volume mounted below. Setting the
+      # env var explicitly causes EISDIR: nspady treats the env value as a
+      # FILE PATH, not a directory, and the directory mount point is not
+      # readable as a file.
     volumes:
       # Long-form bind with `create_host_path: false` so Docker FAILS FAST if
       # gcp-oauth.keys.json is missing on the host instead of silently
