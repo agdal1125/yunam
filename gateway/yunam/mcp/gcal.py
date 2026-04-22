@@ -119,6 +119,7 @@ class GCalMCPClient:
         self._url = url
         self._timeout_s = timeout_s
         self._http: httpx.AsyncClient | None = None
+        self._session_id: str | None = None
         self._tools: tuple[dict[str, Any], ...] = ()
 
     async def connect(self) -> None:
@@ -131,14 +132,47 @@ class GCalMCPClient:
             raise RuntimeError("GCalMCPClient already connected")
         self._http = httpx.AsyncClient(timeout=self._timeout_s)
         try:
-            await self._rpc(
-                "initialize",
-                {
-                    "protocolVersion": PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {"name": "yunam-gateway", "version": "1"},
+            # `initialize` is special: we issue it manually so we can read the
+            # `mcp-session-id` response header. The forked nspady (stateful
+            # mode) assigns a fresh session id per initialize; subsequent
+            # requests on this session must echo it via header.
+            init_response = await self._http.post(
+                self._url,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": uuid.uuid4().hex,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {"name": "yunam-gateway", "version": "1"},
+                    },
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json, text/event-stream",
                 },
             )
+            if init_response.status_code >= 400:
+                body_preview = init_response.text[:500].replace("\n", " ")
+                raise RuntimeError(
+                    f"MCP HTTP {init_response.status_code} on initialize: {body_preview}"
+                )
+            self._session_id = init_response.headers.get("mcp-session-id")
+            if not self._session_id:
+                logger.warning(
+                    "gcal MCP: initialize response has no mcp-session-id header; "
+                    "server may not be in stateful mode — tools/list will likely 500"
+                )
+            # Surface init-level errors embedded in the payload (protocol errors
+            # vs transport errors).
+            init_payload = _parse_mcp_response(init_response.text)
+            if isinstance(init_payload, dict) and "error" in init_payload:
+                err = init_payload["error"]
+                raise RuntimeError(
+                    f"MCP initialize error: code={err.get('code')} "
+                    f"msg={err.get('message')!r}"
+                )
             # MCP spec: after `initialize` response, the client MUST send the
             # `notifications/initialized` notification before issuing further
             # requests. The `mcp` SDK's ClientSession did this automatically;
@@ -149,6 +183,7 @@ class GCalMCPClient:
         except Exception:
             await self._http.aclose()
             self._http = None
+            self._session_id = None
             raise
         raw_tools = listed.get("tools", []) if isinstance(listed, dict) else []
         # Sort by name for prompt-cache prefix stability (CLAUDE.md invariant).
@@ -170,7 +205,23 @@ class GCalMCPClient:
             logger.exception("gcal MCP http close raised")
         finally:
             self._http = None
+            self._session_id = None
             self._tools = ()
+
+    def _request_headers(self) -> dict[str, str]:
+        """Shared headers for POSTs to the MCP endpoint.
+
+        Includes `mcp-session-id` when set (stateful mode, which is what our
+        forked nspady uses). Omitting the header is fine for the initial
+        `initialize` request — the server assigns the id in its response.
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        }
+        if self._session_id:
+            headers["mcp-session-id"] = self._session_id
+        return headers
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         """Invoke an MCP tool by name. Returns the tool's content as text.
@@ -216,11 +267,7 @@ class GCalMCPClient:
                 "method": method,
                 "params": params,
             },
-            headers={
-                "Content-Type": "application/json",
-                # nspady only responds if the client advertises SSE acceptance.
-                "Accept": "application/json, text/event-stream",
-            },
+            headers=self._request_headers(),
         )
         if response.status_code >= 400:
             # Surface the server's error body — nspady usually returns a
@@ -256,10 +303,7 @@ class GCalMCPClient:
                 "method": method,
                 "params": params,
             },
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json, text/event-stream",
-            },
+            headers=self._request_headers(),
         )
         if response.status_code >= 400:
             body_preview = response.text[:300].replace("\n", " ")
