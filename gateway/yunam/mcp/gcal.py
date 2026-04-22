@@ -139,6 +139,12 @@ class GCalMCPClient:
                     "clientInfo": {"name": "yunam-gateway", "version": "1"},
                 },
             )
+            # MCP spec: after `initialize` response, the client MUST send the
+            # `notifications/initialized` notification before issuing further
+            # requests. The `mcp` SDK's ClientSession did this automatically;
+            # we replicate it here or nspady's server-side state machine
+            # rejects subsequent tools/list / tools/call with HTTP 500.
+            await self._notify("notifications/initialized", {})
             listed = await self._rpc("tools/list", {})
         except Exception:
             await self._http.aclose()
@@ -216,7 +222,14 @@ class GCalMCPClient:
                 "Accept": "application/json, text/event-stream",
             },
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Surface the server's error body — nspady usually returns a
+            # JSON-RPC error payload even on HTTP 500, which is the most
+            # useful diagnostic for "why did the server reject this?".
+            body_preview = response.text[:500].replace("\n", " ")
+            raise RuntimeError(
+                f"MCP HTTP {response.status_code} on {method}: {body_preview}"
+            )
         payload = _parse_mcp_response(response.text)
         if not isinstance(payload, dict):
             raise RuntimeError(f"unexpected MCP response shape: {type(payload).__name__}")
@@ -226,6 +239,36 @@ class GCalMCPClient:
                 f"MCP error: code={err.get('code')} msg={err.get('message')!r}"
             )
         return payload.get("result")
+
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        """Send a JSON-RPC notification (no id, no response parsing).
+
+        MCP uses notifications for one-way messages like `notifications/initialized`.
+        We don't raise on non-2xx here — the server typically returns HTTP 202
+        or empty 200, and a weird status on a notification is less critical
+        than on a request.
+        """
+        assert self._http is not None
+        response = await self._http.post(
+            self._url,
+            json={
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            },
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        if response.status_code >= 400:
+            body_preview = response.text[:300].replace("\n", " ")
+            logger.info(
+                "MCP notification %s returned HTTP %d: %s",
+                method,
+                response.status_code,
+                body_preview,
+            )
 
 
 def _parse_mcp_response(body: str) -> Any:
