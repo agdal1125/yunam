@@ -25,6 +25,7 @@ class Config:
     schedule_enabled: bool
     daily_reflection_hour: int
     daily_reflection_minute: int
+    jina_api_key: str | None
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -48,6 +49,8 @@ def load_config() -> Config:
     db_path = Path(os.environ.get("YUNAM_DB_PATH", "/data/yunam/yunam.db")).resolve()
     hour, minute = _parse_hhmm(os.environ.get("YUNAM_DAILY_REFLECTION_TIME", "22:30"))
 
+    jina_api_key_raw = os.environ.get("JINA_API_KEY", "").strip()
+
     return Config(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
         allowed_user_id=int(os.environ["TELEGRAM_ALLOWED_USER_ID"]),
@@ -60,6 +63,7 @@ def load_config() -> Config:
         schedule_enabled=_parse_bool(os.environ.get("YUNAM_SCHEDULE_ENABLED", "false")),
         daily_reflection_hour=hour,
         daily_reflection_minute=minute,
+        jina_api_key=jina_api_key_raw or None,
     )
 
 

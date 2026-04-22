@@ -35,9 +35,15 @@ from yunam.prompts import DAILY_PROMPT_TEMPLATE
 from yunam.scheduler import run_daily_scheduler
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
-from yunam.skills import SkillRegistry, build_files_skill, build_obsidian_skill
+from yunam.skills import (
+    SkillRegistry,
+    build_files_skill,
+    build_obsidian_skill,
+    build_web_skill,
+)
 from yunam.tools.attachments import AttachmentTools
 from yunam.tools.obsidian import ObsidianTools
+from yunam.tools.web import WebTools
 
 load_dotenv()
 configure_logging()
@@ -291,13 +297,16 @@ async def _run() -> None:
         embedder=embedder,
         timezone=cfg.timezone,
     )
+    web_tools = WebTools(jina_api_key=cfg.jina_api_key)
     # Skill order is a prompt-cache-affecting invariant — the flattened tool
-    # list Claude sees is [obsidian tools..., files tools...], and the
-    # concatenated system prompt mirrors that order. Don't reshuffle casually.
+    # list Claude sees is [obsidian tools..., files tools..., web tools...],
+    # and the concatenated system prompt mirrors that order. Don't reshuffle
+    # casually — new skills go at the end.
     registry = SkillRegistry(
         [
             build_obsidian_skill(tools),
             build_files_skill(attachments),
+            build_web_skill(web_tools),
         ]
     )
     orch = Orchestrator(claude_client, store, registry, timezone=cfg.timezone)

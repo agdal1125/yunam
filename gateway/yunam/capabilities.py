@@ -22,6 +22,8 @@ class Scope(str, Enum):
     FILEVAULT_READ = "filevault:read"
     FILEVAULT_WRITE = "filevault:write"
     FILEVAULT_SEND = "filevault:send"
+    WEB_SEARCH = "web:search"
+    WEB_FETCH = "web:fetch"
 
     def __str__(self) -> str:
         return self.value
