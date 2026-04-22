@@ -19,3 +19,62 @@ services:
       - YUNAM_DB_PATH=/data/yunam/yunam.db
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
+    depends_on:
+      calendar-mcp:
+        condition: service_healthy
+        required: false  # gcal is optional — gateway starts even if MCP is disabled
+
+  # Google Calendar MCP server (nspady/google-calendar-mcp).
+  #
+  # Profile-gated: only starts when you explicitly include it, e.g.:
+  #   docker compose --profile gcal up -d --build
+  # Plain `docker compose up -d` skips it entirely. This way the base stack
+  # works even before you've cloned nspady into ./mcp-servers/google-calendar-mcp.
+  #
+  # Yunam reaches this over the internal docker network at http://calendar-mcp:3000/mcp.
+  # No port is published to the host — zero attack surface from outside the VPS.
+  # See docs/gcal-setup.md for OAuth bootstrap (including the temporary
+  # docker-compose.consent.yml override that publishes ports 3500-3505 to
+  # VPS localhost only during the one-time consent flow).
+  calendar-mcp:
+    profiles: ["gcal"]
+    build: ./mcp-servers/google-calendar-mcp
+    container_name: yunam-calendar-mcp
+    restart: unless-stopped
+    environment:
+      - TRANSPORT=http
+      - HOST=0.0.0.0          # 0.0.0.0 so the gateway container can reach it via docker network
+      - PORT=3000
+      - GOOGLE_OAUTH_CREDENTIALS=/app/gcp-oauth.keys.json
+      - GOOGLE_CALENDAR_MCP_TOKEN_PATH=/home/nodejs/.config/google-calendar-mcp
+    volumes:
+      # Long-form bind with `create_host_path: false` so Docker FAILS FAST if
+      # gcp-oauth.keys.json is missing on the host instead of silently
+      # creating an empty directory (which nspady then tries to `fs.readFile`
+      # → EISDIR). If this service fails to start with "bind source path
+      # does not exist", re-upload your OAuth credentials to ~/yunam/.
+      - type: bind
+        source: ./gcp-oauth.keys.json
+        target: /app/gcp-oauth.keys.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - calendar-tokens:/home/nodejs/.config/google-calendar-mcp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
+
+volumes:
+  calendar-tokens:
+    driver: local

@@ -24,6 +24,10 @@ class Scope(str, Enum):
     FILEVAULT_SEND = "filevault:send"
     WEB_SEARCH = "web:search"
     WEB_FETCH = "web:fetch"
+    AIRQUALITY_READ = "airquality:read"
+    PARCEL_READ = "parcel:read"
+    CALENDAR_READ = "calendar:read"
+    CALENDAR_WRITE = "calendar:write"
 
     def __str__(self) -> str:
         return self.value

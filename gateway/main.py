@@ -35,15 +35,21 @@ from yunam.prompts import DAILY_PROMPT_TEMPLATE
 from yunam.scheduler import run_daily_scheduler
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
+from yunam.mcp import GCalMCPClient, build_gcal_mcp_skill
 from yunam.skills import (
+    Skill,
     SkillRegistry,
+    build_airquality_skill,
     build_files_skill,
     build_obsidian_skill,
+    build_parcel_skill,
     build_web_skill,
 )
 from yunam.subagents import build_deep_think_orchestrator
+from yunam.tools.airquality import AirQualityTools
 from yunam.tools.attachments import AttachmentTools
 from yunam.tools.obsidian import ObsidianTools
+from yunam.tools.parcel import ParcelTools
 from yunam.tools.web import WebTools
 
 load_dotenv()
@@ -335,17 +341,37 @@ async def _run() -> None:
         timezone=cfg.timezone,
     )
     web_tools = WebTools(jina_api_key=cfg.jina_api_key)
+    airquality_tools = AirQualityTools()
+    parcel_tools = ParcelTools(api_key=cfg.sweettracker_api_key)
+
+    # Optional: connect to the Google Calendar MCP sibling container. If the
+    # URL is unset we skip the skill entirely (dev-time or pre-OAuth state).
+    # If the URL is set but unreachable, fail fast — silent skipping there
+    # would hide a misconfiguration.
+    gcal_client: GCalMCPClient | None = None
+    gcal_skill: Skill | None = None
+    if cfg.gcal_mcp_url:
+        logger.info("gcal MCP configured at %s — connecting", cfg.gcal_mcp_url)
+        gcal_client = GCalMCPClient(cfg.gcal_mcp_url)
+        await gcal_client.connect()
+        gcal_skill = build_gcal_mcp_skill(gcal_client)
+    else:
+        logger.info("YUNAM_GCAL_MCP_URL unset — gcal skill disabled")
+
     # Skill order is a prompt-cache-affecting invariant — the flattened tool
-    # list Claude sees is [obsidian tools..., files tools..., web tools...],
+    # list Claude sees is [obsidian, files, web, airquality, parcel, gcal?],
     # and the concatenated system prompt mirrors that order. Don't reshuffle
     # casually — new skills go at the end.
-    registry = SkillRegistry(
-        [
-            build_obsidian_skill(tools),
-            build_files_skill(attachments),
-            build_web_skill(web_tools),
-        ]
-    )
+    skills: list[Skill] = [
+        build_obsidian_skill(tools),
+        build_files_skill(attachments),
+        build_web_skill(web_tools),
+        build_airquality_skill(airquality_tools),
+        build_parcel_skill(parcel_tools),
+    ]
+    if gcal_skill is not None:
+        skills.append(gcal_skill)
+    registry = SkillRegistry(skills)
     orch = Orchestrator(claude_client, store, registry, timezone=cfg.timezone)
     # Deep-think path (Opus 4.7 + adaptive / high effort) — only invoked via
     # the /think command, never by the main agent autonomously.
@@ -439,6 +465,8 @@ async def _run() -> None:
             await app.shutdown()
         except Exception:
             logger.exception("error during shutdown")
+        if gcal_client is not None:
+            await gcal_client.close()
         await store.close()
         logger.info("gateway stopped cleanly")
 

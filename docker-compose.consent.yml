@@ -1,0 +1,30 @@
+# Override used ONLY during the one-time Google OAuth consent flow.
+#
+# Normal operation (docker-compose.yml alone) keeps calendar-mcp purely on the
+# internal Docker network — zero inbound ports. That's safe but prevents the
+# browser-based OAuth callback (https://accounts.google.com → localhost:3500)
+# from reaching the container through an SSH tunnel.
+#
+# During consent, start the stack with BOTH files merged so ports 3500-3505
+# briefly bind to the VPS's localhost interface (NOT 0.0.0.0 — we don't want
+# the OAuth callback reachable from the open internet):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.consent.yml \
+#     up calendar-mcp
+#
+# Then SSH-forward those ports to your laptop and open the consent URL in a
+# local browser. After the token lands in the `calendar-tokens` volume,
+# stop this override and restart normally:
+#
+#   docker compose down
+#   docker compose up -d --build
+
+services:
+  calendar-mcp:
+    ports:
+      - "127.0.0.1:3500:3500"
+      - "127.0.0.1:3501:3501"
+      - "127.0.0.1:3502:3502"
+      - "127.0.0.1:3503:3503"
+      - "127.0.0.1:3504:3504"
+      - "127.0.0.1:3505:3505"

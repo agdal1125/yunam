@@ -26,6 +26,8 @@ class Config:
     daily_reflection_hour: int
     daily_reflection_minute: int
     jina_api_key: str | None
+    sweettracker_api_key: str | None
+    gcal_mcp_url: str | None
 
 
 def _parse_hhmm(value: str) -> tuple[int, int]:
@@ -50,6 +52,8 @@ def load_config() -> Config:
     hour, minute = _parse_hhmm(os.environ.get("YUNAM_DAILY_REFLECTION_TIME", "22:30"))
 
     jina_api_key_raw = os.environ.get("JINA_API_KEY", "").strip()
+    sweettracker_api_key_raw = os.environ.get("SWEETTRACKER_API_KEY", "").strip()
+    gcal_mcp_url_raw = os.environ.get("YUNAM_GCAL_MCP_URL", "").strip()
 
     return Config(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -64,6 +68,8 @@ def load_config() -> Config:
         daily_reflection_hour=hour,
         daily_reflection_minute=minute,
         jina_api_key=jina_api_key_raw or None,
+        sweettracker_api_key=sweettracker_api_key_raw or None,
+        gcal_mcp_url=gcal_mcp_url_raw or None,
     )
 
 
