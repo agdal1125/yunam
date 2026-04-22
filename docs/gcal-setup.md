@@ -158,18 +158,12 @@ docker compose stop gateway
 **laptop에서 새 터미널** 열고:
 
 ```bash
-ssh -N \
-    -L 3500:localhost:3500 \
-    -L 3501:localhost:3501 \
-    -L 3502:localhost:3502 \
-    -L 3503:localhost:3503 \
-    -L 3504:localhost:3504 \
-    -L 3505:localhost:3505 \
-    yunam
+ssh -N -L 3000:localhost:3000 yunam
 ```
 
 - `-N` = 커맨드 없이 터널만 유지. 프롬프트가 안 돌아오는 게 정상.
-- `-L 3500:localhost:3500` = "내 laptop의 3500 포트를 VPS의 localhost:3500 으로 연결".
+- `-L 3000:localhost:3000` = "내 laptop의 3000 포트를 VPS의 localhost:3000 으로 연결".
+- nspady의 HTTP 모드에서는 **포트 3000 하나만** 필요합니다 — auth 랜딩, OAuth URL 발급, Google callback 모두 3000에서 처리.
 - 이 터미널은 **consent가 끝날 때까지 그대로 둠**. Ctrl+C 하면 터널 끊김.
 
 ✅ 확인: 커맨드 실행 후 프롬프트가 돌아오지 않고 대기 상태면 OK.
@@ -195,34 +189,36 @@ docker compose \
 
 ✅ 확인: 로그 마지막에 다음 비슷한 줄이 보여야 함:
 ```
-calendar-mcp | [info] Server listening on http://0.0.0.0:3000
-calendar-mcp | [info] Authentication required. Visit:
-calendar-mcp | [info]   https://accounts.google.com/o/oauth2/v2/auth?client_id=xxxxx&...
+calendar-mcp | No token file found at: /home/nodejs/.config/google-calendar-mcp/tokens.json
+calendar-mcp | ⚠️  No valid normal user authentication tokens found.
+calendar-mcp | Visit the server URL in your browser to authenticate, or run "npm run auth" separately.
+calendar-mcp | Google Calendar MCP Server listening on http://0.0.0.0:3000
 ```
 
-이 URL이 **consent URL** 입니다. 통째로 복사.
+서버가 토큰 없이도 올라오는 상태 — 이제 브라우저로 인증 붙일 차례.
 
 ### 3.4 laptop 브라우저에서 consent
 
-1. 위에서 복사한 URL을 laptop 브라우저 주소창에 붙여넣기 → Enter
-2. Google 로그인 → jaekeun 계정 선택
-3. **"이 앱은 확인되지 않았습니다"** 경고 뜨면 → **"고급"** → **"Yunam (안전하지 않음)으로 이동"**
+1. laptop 브라우저 주소창에: **`http://localhost:3000/`** 열기 (터미널 A의 SSH 터널을 타고 VPS로 도달)
+2. nspady의 **계정 관리 페이지**가 열림 — "Add Account" 같은 버튼
+3. 계정 ID 입력 (예: `normal` 또는 `jaekeun` 아무 문자열) → Submit → Google OAuth URL로 자동 리디렉트
+4. Google 로그인 → jaekeun 계정 선택
+5. **"이 앱은 확인되지 않았습니다"** 경고 뜨면 → **"고급"** → **"Yunam (안전하지 않음)으로 이동"**
    - 테스트 모드라서 뜨는 경고, 정상
-4. 권한 요청 화면: Calendar + Calendar Events 접근 권한 → **허용**
-5. 최종 페이지: "Authentication successful — you may close this window" 비슷한 메시지
-   - 이 순간 브라우저가 `http://localhost:3500/oauth2callback?code=...` 로 리디렉트 시도하고, laptop의 3500 포트 → SSH 터널 → VPS localhost:3500 → calendar-mcp 컨테이너로 전달됨.
+6. 권한 요청 화면: Calendar + Calendar Events 접근 권한 → **허용**
+7. Google이 `http://localhost:3000/oauth2callback?code=...&account=...` 로 리디렉트
+   - laptop 브라우저가 localhost:3000 을 치면 SSH 터널 → VPS localhost:3000 → calendar-mcp 컨테이너로 전달
+8. "Authentication successful" 비슷한 최종 페이지
 
-✅ 확인: 터미널 B 로그에 다음 비슷한 라인:
+✅ 확인: 터미널 B 로그에:
 ```
-calendar-mcp | [info] Received authorization code
-calendar-mcp | [info] Tokens stored at /home/nodejs/.config/google-calendar-mcp/tokens.json
-calendar-mcp | [info] Authentication complete. Account: jaekeun@gmail.com
+calendar-mcp | Tokens saved successfully for normal account to: /home/nodejs/.config/google-calendar-mcp/tokens.json
 ```
 
 ### 3.5 정리
 
 - **터미널 B**: `Ctrl+C` 로 calendar-mcp 중지
-- **터미널 A**: `Ctrl+C` 로 SSH 터널 끊기 (이제 3500~3505 포트 필요 없음)
+- **터미널 A**: `Ctrl+C` 로 SSH 터널 끊기 (이제 3000 포트 host 노출 필요 없음)
 
 ✅ 토큰이 저장됐는지 확인:
 ```bash

@@ -1,30 +1,26 @@
 # Override used ONLY during the one-time Google OAuth consent flow.
 #
 # Normal operation (docker-compose.yml alone) keeps calendar-mcp purely on the
-# internal Docker network — zero inbound ports. That's safe but prevents the
-# browser-based OAuth callback (https://accounts.google.com → localhost:3500)
-# from reaching the container through an SSH tunnel.
+# internal Docker network — zero inbound ports. Safe, but it prevents the
+# browser from reaching the OAuth landing UI at http://calendar-mcp:3000/.
 #
-# During consent, start the stack with BOTH files merged so ports 3500-3505
-# briefly bind to the VPS's localhost interface (NOT 0.0.0.0 — we don't want
-# the OAuth callback reachable from the open internet):
+# In nspady's HTTP mode, port 3000 handles EVERYTHING for the OAuth flow:
+#   GET /                  → account-management UI
+#   POST /api/accounts     → returns Google OAuth URL
+#   GET /oauth2callback    → catches Google's code redirect
 #
-#   docker compose -f docker-compose.yml -f docker-compose.consent.yml \
-#     up calendar-mcp
+# Ports 3500-3505 are NOT used in HTTP mode (they're stdio / CLI only), so
+# we only publish 3000 here — bound to 127.0.0.1 so the OAuth endpoint
+# isn't exposed to the open internet. Access from laptop is via SSH tunnel:
+#   ssh -N -L 3000:localhost:3000 yunam
+# Then open http://localhost:3000/ in the laptop browser.
 #
-# Then SSH-forward those ports to your laptop and open the consent URL in a
-# local browser. After the token lands in the `calendar-tokens` volume,
-# stop this override and restart normally:
-#
-#   docker compose down
-#   docker compose up -d --build
+# After the token lands in `calendar-tokens`, stop this override and
+# restart normally:
+#   docker compose --profile gcal down
+#   docker compose --profile gcal up -d --build
 
 services:
   calendar-mcp:
     ports:
-      - "127.0.0.1:3500:3500"
-      - "127.0.0.1:3501:3501"
-      - "127.0.0.1:3502:3502"
-      - "127.0.0.1:3503:3503"
-      - "127.0.0.1:3504:3504"
-      - "127.0.0.1:3505:3505"
+      - "127.0.0.1:3000:3000"
