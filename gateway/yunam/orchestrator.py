@@ -19,15 +19,19 @@ from langgraph.graph import END, START, StateGraph
 
 from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
-from .skills import DispatchContext, SkillRegistry
+from .skills.base import DispatchContext, SkillRegistry
 from .tools.vault import VaultError
 
 logger = logging.getLogger("yunam.orchestrator")
 
-MODEL = "claude-opus-4-7"
-MAX_TOKENS = 16000
 MAX_ITERATIONS = 10
 RESULT_PREVIEW_CHARS = 500
+
+# Main-path defaults: Sonnet 4.6 at 4k output, no extended thinking.
+# Deep-think mode (subagents/deep_think.py) overrides these to Opus 4.7 with
+# adaptive thinking at high effort. Keep these defaults cheap; /think opts in.
+DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MAX_TOKENS = 4096
 
 
 class AgentState(TypedDict):
@@ -86,11 +90,20 @@ class Orchestrator:
         store: SessionStore,
         registry: SkillRegistry,
         timezone: str = "Asia/Seoul",
+        *,
+        model: str = DEFAULT_MODEL,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        thinking: dict[str, Any] | None = None,
+        output_config: dict[str, Any] | None = None,
     ):
         self._claude = claude_client
         self._store = store
         self._registry = registry
         self._tz = ZoneInfo(timezone)
+        self._model = model
+        self._max_tokens = max_tokens
+        self._thinking = thinking
+        self._output_config = output_config
         # Compose the system prompt and tool-schemas list exactly once, in the
         # registry's declared skill order. Both must be byte-stable across
         # turns for Anthropic's prompt cache to keep hitting.
@@ -145,27 +158,34 @@ class Orchestrator:
         final_response: Any = None
 
         for iteration in range(MAX_ITERATIONS):
-            response = await self._claude.messages.create(
-                model=MODEL,
-                max_tokens=MAX_TOKENS,
-                system=[
+            create_kwargs: dict[str, Any] = {
+                "model": self._model,
+                "max_tokens": self._max_tokens,
+                "system": [
                     {
                         "type": "text",
                         "text": self._system_prompt,
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
-                thinking={"type": "adaptive"},
-                output_config={"effort": "high"},
-                tools=self._tool_schemas,
-                messages=messages,
-            )
+                "tools": self._tool_schemas,
+                "messages": messages,
+            }
+            # Extended thinking / effort are only sent when this Orchestrator
+            # was constructed with them — keeps the Sonnet main path from
+            # emitting Opus-only parameters the API would reject.
+            if self._thinking is not None:
+                create_kwargs["thinking"] = self._thinking
+            if self._output_config is not None:
+                create_kwargs["output_config"] = self._output_config
+            response = await self._claude.messages.create(**create_kwargs)
             final_response = response
 
             usage = getattr(response, "usage", None)
             if usage is not None:
                 logger.info(
-                    "claude turn=%d stop=%s in=%s out=%s cache_read=%s cache_create=%s",
+                    "claude model=%s turn=%d stop=%s in=%s out=%s cache_read=%s cache_create=%s",
+                    self._model,
                     iteration,
                     getattr(response, "stop_reason", "?"),
                     getattr(usage, "input_tokens", "?"),

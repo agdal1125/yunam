@@ -41,6 +41,7 @@ from yunam.skills import (
     build_obsidian_skill,
     build_web_skill,
 )
+from yunam.subagents import build_deep_think_orchestrator
 from yunam.tools.attachments import AttachmentTools
 from yunam.tools.obsidian import ObsidianTools
 from yunam.tools.web import WebTools
@@ -247,6 +248,42 @@ async def on_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _commit_and_reply(update, context, caption_override=remainder or None)
 
 
+async def on_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle `/think <query>` — route to the Opus deep-think orchestrator."""
+    cfg: Config = context.application.bot_data["cfg"]
+    if not _is_authorized(update, cfg.allowed_user_id):
+        return
+
+    text = (update.message.text or "").strip()
+    # `/think` with optional args — split on first whitespace.
+    parts = text.split(maxsplit=1)
+    query = parts[1].strip() if len(parts) > 1 else ""
+    if not query:
+        await update.message.reply_text(
+            "Usage: /think <your question>\n"
+            "Routes to Opus 4.7 with adaptive thinking. Costs more — use for "
+            "problems where Sonnet's default reply feels shallow."
+        )
+        return
+
+    chat_id = update.effective_chat.id
+    logger.info("/think start chat_id=%s len=%d", chat_id, len(query))
+
+    try:
+        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
+    except Exception:
+        logger.debug("send_chat_action failed", exc_info=True)
+
+    deep_orch: Orchestrator = context.application.bot_data["deep_orch"]
+    try:
+        response = await deep_orch.handle_turn(chat_id, query)
+    except Exception:
+        logger.exception("/think orchestrator failure chat_id=%s", chat_id)
+        response = "Sorry — deep-think failed. Check the logs."
+
+    await update.message.reply_text(response[:TELEGRAM_MSG_LIMIT])
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: Config = context.application.bot_data["cfg"]
     if not _is_authorized(update, cfg.allowed_user_id):
@@ -310,14 +347,21 @@ async def _run() -> None:
         ]
     )
     orch = Orchestrator(claude_client, store, registry, timezone=cfg.timezone)
+    # Deep-think path (Opus 4.7 + adaptive / high effort) — only invoked via
+    # the /think command, never by the main agent autonomously.
+    deep_orch = build_deep_think_orchestrator(
+        claude_client, store, registry, timezone=cfg.timezone
+    )
 
     app.bot_data["cfg"] = cfg
     app.bot_data["orch"] = orch
+    app.bot_data["deep_orch"] = deep_orch
     app.bot_data["store"] = store
     app.bot_data["attachments"] = attachments
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("save", on_save))
+    app.add_handler(CommandHandler("think", on_think))
     # Attachment handlers — order doesn't matter, filters are disjoint.
     attachment_filter = (
         filters.PHOTO

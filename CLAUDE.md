@@ -148,24 +148,45 @@ Stop the local container before starting the VPS one, otherwise two bots will ra
 
 LangGraph: `START → load_history → agent_step → persist → END`. Three nodes, linear, no conditional edges. The Claude + tool loop lives **inside** `agent_step` — splitting call/tool into separate LangGraph nodes buys nothing and complicates prompt-caching audits. The orchestrator consumes a `SkillRegistry` built once at startup and uses `registry.lookup(name)` on every tool_use block; it never references individual tool classes. See [gateway/yunam/orchestrator.py](gateway/yunam/orchestrator.py).
 
-### Claude request shape (Opus 4.7)
+### Claude request shape (dual-model: Sonnet default, Opus on `/think`)
 
+The main orchestrator runs on **Sonnet 4.6** with no extended thinking. A
+second `Orchestrator` instance configured for **Opus 4.7** with adaptive
+thinking at high effort is invoked only when the user sends `/think <query>`
+in Telegram — the main Sonnet path never delegates to it autonomously. Both
+share the same `SkillRegistry` so tool surface and vault state are identical;
+Anthropic caches prefix per-model so each path stabilizes its own cache.
+
+Main (Sonnet 4.6) request:
+```python
+response = await client.messages.create(
+    model="claude-sonnet-4-6",
+    max_tokens=4096,
+    system=[{"type": "text", "text": self._system_prompt,
+             "cache_control": {"type": "ephemeral"}}],
+    tools=self._tool_schemas,
+    messages=messages,
+    # no `thinking` / `output_config` — Sonnet path is cost-optimized
+)
+```
+
+Deep-think (Opus 4.7) request — built by `subagents/deep_think.py`:
 ```python
 response = await client.messages.create(
     model="claude-opus-4-7",
-    max_tokens=16000,
-    system=[{"type": "text", "text": self._system_prompt,   # core + skill fragments, composed once
+    max_tokens=8000,
+    system=[{"type": "text", "text": self._system_prompt,
              "cache_control": {"type": "ephemeral"}}],
-    thinking={"type": "adaptive"},       # only valid mode on 4.7
-    output_config={"effort": "high"},
-    tools=self._tool_schemas,            # flattened from registry in declared skill order
+    thinking={"type": "adaptive"},       # Opus-4.7-only
+    output_config={"effort": "high"},    # Opus-4.7-only
+    tools=self._tool_schemas,
     messages=messages,
 )
 ```
 
 `self._system_prompt` is built in `Orchestrator.__init__` as `SYSTEM_PROMPT + "\n\n" + "\n\n".join(registry.system_prompt_fragments)`. `self._tool_schemas` is `registry.tool_schemas` — computed eagerly, byte-stable across turns. Both are intentionally assembled once; never rebuild per turn.
 
-Forbidden on 4.7 (all 400 errors): `temperature`, `top_p`, `top_k`, `budget_tokens`, assistant prefilling.
+Forbidden on Opus 4.7 (all 400 errors): `temperature`, `top_p`, `top_k`, `budget_tokens`, assistant prefilling. `thinking` + `output_config` are Opus-4.7-only; the Sonnet path omits them entirely.
 
 ### Prompt caching invariants
 

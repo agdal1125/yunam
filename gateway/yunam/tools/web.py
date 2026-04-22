@@ -29,7 +29,10 @@ class WebError(Exception):
     """Raised by web primitives for anything the tool should surface to the model."""
 
 
-MAX_BYTES: Final = 500_000
+# 80 KB ≈ 20k Claude tokens per fetch — big enough for most article/doc bodies,
+# small enough that a single fetch can't blow up the next turn's input tokens.
+# Earlier 500 KB cap caused ~125k-token turns when a verbose page came back.
+MAX_BYTES: Final = 80_000
 DEFAULT_TIMEOUT_S: Final = 15.0
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
