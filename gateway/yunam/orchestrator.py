@@ -19,12 +19,7 @@ from langgraph.graph import END, START, StateGraph
 
 from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
-from .tools.attachments import (
-    ATTACHMENT_TOOL_NAMES,
-    ATTACHMENT_TOOL_SCHEMAS,
-    AttachmentTools,
-)
-from .tools.obsidian import OBSIDIAN_TOOL_SCHEMAS, ObsidianTools
+from .skills import DispatchContext, SkillRegistry
 from .tools.vault import VaultError
 
 logger = logging.getLogger("yunam.orchestrator")
@@ -89,22 +84,25 @@ class Orchestrator:
         self,
         claude_client: ClaudeClient,
         store: SessionStore,
-        tools: ObsidianTools,
-        attachments: AttachmentTools | None = None,
+        registry: SkillRegistry,
         timezone: str = "Asia/Seoul",
     ):
         self._claude = claude_client
         self._store = store
-        self._tools = tools
-        self._attachments = attachments
-        # Schemas are concatenated once at init — stable byte-identical ordering
-        # across turns is what prompt caching depends on.
-        if attachments is not None:
-            self._tool_schemas = list(OBSIDIAN_TOOL_SCHEMAS) + list(ATTACHMENT_TOOL_SCHEMAS)
-        else:
-            self._tool_schemas = list(OBSIDIAN_TOOL_SCHEMAS)
+        self._registry = registry
         self._tz = ZoneInfo(timezone)
+        # Compose the system prompt and tool-schemas list exactly once, in the
+        # registry's declared skill order. Both must be byte-stable across
+        # turns for Anthropic's prompt cache to keep hitting.
+        self._system_prompt = self._build_system_prompt()
+        self._tool_schemas = registry.tool_schemas
         self._graph = self._build_graph()
+
+    def _build_system_prompt(self) -> str:
+        fragments = self._registry.system_prompt_fragments
+        if not fragments:
+            return SYSTEM_PROMPT
+        return SYSTEM_PROMPT + "\n\n" + "\n\n".join(fragments)
 
     def _build_graph(self):
         builder = StateGraph(AgentState)
@@ -153,7 +151,7 @@ class Orchestrator:
                 system=[
                     {
                         "type": "text",
-                        "text": SYSTEM_PROMPT,
+                        "text": self._system_prompt,
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
@@ -208,17 +206,19 @@ class Orchestrator:
                 inputs = block.input or {}
                 t0 = time.monotonic()
                 is_error = False
+                # Capture skill_id/scope before invoking so an exception inside
+                # the handler still produces a complete audit row.
+                skill_id: str | None = None
+                scope: str | None = None
                 try:
-                    if name in ATTACHMENT_TOOL_NAMES:
-                        if self._attachments is None:
-                            raise VaultError(
-                                "attachment tools not available in this runtime"
-                            )
-                        result = await self._attachments.dispatch(
-                            name, inputs, chat_id=state["chat_id"]
-                        )
-                    else:
-                        result = await self._tools.dispatch(name, inputs)
+                    skill, tool_spec = self._registry.lookup(name)
+                    skill_id = skill.id
+                    scope = str(tool_spec.scope)
+                    handler_inputs = inputs if isinstance(inputs, dict) else {}
+                    result = await tool_spec.handler(
+                        handler_inputs,
+                        DispatchContext(chat_id=state["chat_id"]),
+                    )
                 except VaultError as e:
                     result = f"Tool error: {e}"
                     is_error = True
@@ -227,7 +227,7 @@ class Orchestrator:
                     result = f"Tool error: {e}"
                     is_error = True
                 except Exception:
-                    logger.exception("tool %s raised", name)
+                    logger.exception("tool %s raised (skill=%s)", name, skill_id)
                     result = "Tool error: internal failure"
                     is_error = True
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
@@ -239,6 +239,8 @@ class Orchestrator:
                         result_preview=(result or "")[:RESULT_PREVIEW_CHARS],
                         is_error=is_error,
                         elapsed_ms=elapsed_ms,
+                        skill_id=skill_id,
+                        scope=scope,
                     )
                 )
                 tool_results.append(

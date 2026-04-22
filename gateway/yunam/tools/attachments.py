@@ -1,9 +1,8 @@
-"""Attachment tools exposed to Claude: save / search / retrieve.
+"""Attachment primitives — save / search / retrieve methods on `AttachmentTools`.
 
-Mirrors the shape of `obsidian.py` — module-level `ATTACHMENT_TOOL_SCHEMAS` list
-with stable order, `AttachmentTools` class bound to its stores/sender, `dispatch()`
-for the orchestrator. Chat ID is passed into dispatch because these tools operate
-per-chat (pending attachments, retrieval destination).
+Schemas, scopes, prompt guidance, and dispatch live in the skill layer
+(`yunam/skills/files.py`). This module is the implementation surface: the class
+bound to the session store, filevault root, Telegram sender, and embedder.
 
 Flow for `save_attachment`:
   1. Look up the most recent pending attachment for this chat.
@@ -20,7 +19,6 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..embeddings import EmbeddingError, VoyageEmbedder
@@ -37,108 +35,6 @@ from .vault import VaultError, write_text_atomic as vault_write_text_atomic
 
 logger = logging.getLogger("yunam.tools.attachments")
 
-
-ATTACHMENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "name": "save_attachment",
-        "description": (
-            "Commit the most recently received attachment (photo, document, video, "
-            "voice note, audio, or animation) to the filevault. Use this when the "
-            "user asks to save/keep a file they just sent without using the /save "
-            "command — e.g. 'save this', '저장해줘', 'keep this for later'. "
-            "You can optionally rename the file and attach a caption/description; "
-            "both are searchable later via `search_files`. Fails if no recent "
-            "attachment is pending for this chat."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "destination_name": {
-                    "type": "string",
-                    "description": (
-                        "Optional new filename (with or without extension). If "
-                        "omitted, uses Telegram's original filename or a date-stamped "
-                        "name for captures with no name (photos, voice notes)."
-                    ),
-                },
-                "caption": {
-                    "type": "string",
-                    "description": (
-                        "Short caption for the file — displayed in the Obsidian "
-                        "breadcrumb and used as a signal in semantic search."
-                    ),
-                },
-                "description": {
-                    "type": "string",
-                    "description": (
-                        "Longer freeform description. Include context the user "
-                        "gave about the file — what it's for, when it was taken, "
-                        "why it matters. Improves semantic retrieval."
-                    ),
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "search_files",
-        "description": (
-            "Semantic search over saved files (photos, documents, audio, etc.) "
-            "in the filevault. Embeds the query with Voyage's multimodal model "
-            "and returns the top-k closest files by cosine distance. Use this "
-            "when the user asks to find a file by meaning — 'the whiteboard photo "
-            "from standup', 'that PDF about taxes', 'the voice note from last week'. "
-            "Returns file path, metadata, caption, and description — NOT the file "
-            "itself. Use `retrieve_attachment` to send a matched file back."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Natural-language description of what to find.",
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Max matches (default 5, max 20).",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "retrieve_attachment",
-        "description": (
-            "Send a saved file from the filevault back to the user as a Telegram "
-            "document. Use this after `search_files` (or when the user references "
-            "a specific saved file by name/path) and they've asked you to actually "
-            "send it. The `path` argument is the filevault-relative path — e.g. "
-            "'2026-04-21/whiteboard.jpg' — exactly as returned by `search_files`."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Filevault-relative path of the file to send. Get this "
-                        "from `search_files` results — do not guess."
-                    ),
-                },
-                "caption": {
-                    "type": "string",
-                    "description": (
-                        "Optional caption for the Telegram message attached to "
-                        "the file."
-                    ),
-                },
-            },
-            "required": ["path"],
-        },
-    },
-]
-
-ATTACHMENT_TOOL_NAMES = {s["name"] for s in ATTACHMENT_TOOL_SCHEMAS}
 
 # Search result caps.
 _MAX_SEARCH_LIMIT = 20
@@ -371,19 +267,10 @@ class AttachmentTools:
             # embedding are already committed. Log and move on.
             logger.warning("breadcrumb write failed for %s: %s", note_relpath, e)
 
-    # ---- dispatch --------------------------------------------------------
-
-    async def dispatch(self, name: str, inputs: dict[str, Any], *, chat_id: int) -> str:
-        if name not in ATTACHMENT_TOOL_NAMES:
-            raise ValueError(f"unknown attachment tool: {name}")
-        method = getattr(self, name)
-        return await method(chat_id=chat_id, **inputs)
-
-
 def _yaml_scalar(value: str) -> str:
     """Quote a YAML scalar that might contain colons/quotes/newlines."""
     escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
     return f'"{escaped}"'
 
 
-__all__ = ["AttachmentTools", "ATTACHMENT_TOOL_SCHEMAS", "ATTACHMENT_TOOL_NAMES"]
+__all__ = ["AttachmentTools"]

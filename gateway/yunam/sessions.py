@@ -100,6 +100,46 @@ CREATE VIRTUAL TABLE IF NOT EXISTS file_embeddings USING vec0(
 
 HISTORY_LIMIT = 20
 
+# Schema version — bump when a migration is added below, and gate the new step
+# on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
+# must be idempotent.
+DB_USER_VERSION = 2
+
+
+async def _column_exists(
+    db: aiosqlite.Connection, table: str, column: str
+) -> bool:
+    async with db.execute(f"PRAGMA table_info({table})") as cur:
+        rows = await cur.fetchall()
+    return any(row[1] == column for row in rows)
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """Bring the schema up to DB_USER_VERSION. Idempotent for any starting state.
+
+    Fresh DBs run every step; upgraded DBs skip steps whose effect is already
+    present. `PRAGMA user_version` is the authoritative marker — the
+    column-exists guards exist only so a pre-versioning DB converges cleanly.
+    """
+    await db.executescript(_SCHEMA)
+
+    async with db.execute("PRAGMA user_version") as cur:
+        row = await cur.fetchone()
+    version = int(row[0]) if row else 0
+
+    # v2: tool_calls gains skill_id + scope (governance bookkeeping).
+    if version < 2:
+        if not await _column_exists(db, "tool_calls", "skill_id"):
+            await db.execute("ALTER TABLE tool_calls ADD COLUMN skill_id TEXT")
+        if not await _column_exists(db, "tool_calls", "scope"):
+            await db.execute("ALTER TABLE tool_calls ADD COLUMN scope TEXT")
+
+    if version < DB_USER_VERSION:
+        await db.execute(f"PRAGMA user_version = {DB_USER_VERSION}")
+        logger.info(
+            "sessions db migrated from user_version=%d to %d", version, DB_USER_VERSION
+        )
+
 
 def _pack_embedding(vector: list[float]) -> bytes:
     """sqlite-vec expects packed little-endian float32 bytes for `float[N]` columns."""
@@ -121,6 +161,11 @@ class ToolCall:
     result_preview: str
     is_error: bool
     elapsed_ms: int
+    # Governance bookkeeping. `skill_id` is None when dispatch failed before the
+    # registry could locate the owning skill (e.g. unknown tool name); `scope`
+    # tracks which capability the tool claimed, as a string for DB portability.
+    skill_id: str | None = None
+    scope: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,7 +206,7 @@ class SessionStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = cls(db_path)
         store._db = await aiosqlite.connect(str(db_path))
-        await store._db.executescript(_SCHEMA)
+        await _migrate(store._db)
         # Load sqlite-vec for the semantic file-search virtual table. Requires
         # a Python build with `enable_load_extension` — standard on the Debian
         # base image we run under Docker. Graceful fallback if unavailable
@@ -279,8 +324,9 @@ class SessionStore:
                     """
                     INSERT INTO tool_calls
                         (chat_id, turn_message_id, name, input_json,
-                         result_preview, is_error, elapsed_ms, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                         result_preview, is_error, elapsed_ms, created_at,
+                         skill_id, scope)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -292,6 +338,8 @@ class SessionStore:
                             1 if tc.is_error else 0,
                             tc.elapsed_ms,
                             now,
+                            tc.skill_id,
+                            tc.scope,
                         )
                         for tc in tool_calls
                     ],

@@ -35,6 +35,7 @@ from yunam.prompts import DAILY_PROMPT_TEMPLATE
 from yunam.scheduler import run_daily_scheduler
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
+from yunam.skills import SkillRegistry, build_files_skill, build_obsidian_skill
 from yunam.tools.attachments import AttachmentTools
 from yunam.tools.obsidian import ObsidianTools
 
@@ -290,9 +291,16 @@ async def _run() -> None:
         embedder=embedder,
         timezone=cfg.timezone,
     )
-    orch = Orchestrator(
-        claude_client, store, tools, attachments=attachments, timezone=cfg.timezone
+    # Skill order is a prompt-cache-affecting invariant — the flattened tool
+    # list Claude sees is [obsidian tools..., files tools...], and the
+    # concatenated system prompt mirrors that order. Don't reshuffle casually.
+    registry = SkillRegistry(
+        [
+            build_obsidian_skill(tools),
+            build_files_skill(attachments),
+        ]
     )
+    orch = Orchestrator(claude_client, store, registry, timezone=cfg.timezone)
 
     app.bot_data["cfg"] = cfg
     app.bot_data["orch"] = orch

@@ -170,6 +170,7 @@ async def _run(real: bool, chat_id: int) -> None:
     from yunam.config import configure_logging  # noqa: E402
     from yunam.orchestrator import Orchestrator  # noqa: E402
     from yunam.sessions import SessionStore  # noqa: E402
+    from yunam.skills import SkillRegistry, build_obsidian_skill  # noqa: E402
     from yunam.tools.obsidian import ObsidianTools  # noqa: E402
 
     configure_logging()
@@ -191,7 +192,10 @@ async def _run(real: bool, chat_id: int) -> None:
 
     store = await SessionStore.open(db_path)
     tools = ObsidianTools(vault)
-    orch = Orchestrator(client, store, tools)
+    # REPL runs with only the obsidian skill — no attachments. The registry
+    # still flattens exactly the tools the fake Claude client expects.
+    registry = SkillRegistry([build_obsidian_skill(tools)])
+    orch = Orchestrator(client, store, registry)
 
     print(f"Yunam REPL — vault={vault}  db={db_path}  mode={'real' if real else 'fake'}")
     print("Type a message (Ctrl-D or 'quit' to exit).\n")

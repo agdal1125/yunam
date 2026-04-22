@@ -1,16 +1,18 @@
-"""Obsidian vault tools exposed to Claude.
+"""Obsidian vault tool primitives — the async methods a skill wraps.
 
-Four async tool functions + a module-level `OBSIDIAN_TOOL_SCHEMAS` list (stable order — don't
-rebuild dynamically; prompt caching depends on byte-identical prefixes across turns).
+Kept deliberately narrow: one class bound to a vault root, four async methods
+(read/write/list/search). Schemas, scopes, prompt guidance, and dispatch live in
+the skill layer (`yunam/skills/obsidian.py`). This module is agnostic of the
+model and the governance layer.
 
-All I/O wrapped in `asyncio.to_thread` so file reads/writes don't block the event loop.
+All I/O is wrapped in `asyncio.to_thread` so file reads/writes don't block the
+event loop.
 """
 
 from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
 
 from .vault import (
     VaultError,
@@ -23,106 +25,6 @@ from .vault import (
 
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_FILE_SIZE = 1_000_000  # skip giant files during search
-
-
-OBSIDIAN_TOOL_SCHEMAS: list[dict[str, Any]] = [
-    {
-        "name": "vault_read",
-        "description": (
-            "Read a Markdown note from the Obsidian vault. Use this to recall prior "
-            "conversation context, saved preferences, research, or anything else "
-            "previously written to the vault. Returns the full file contents as text, "
-            "or an error message if the path is invalid or the file doesn't exist."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": (
-                        "Vault-relative path, e.g. 'daily/2026-04-19.md' or "
-                        "'projects/yunam.md'. Must end in .md."
-                    ),
-                },
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "vault_write",
-        "description": (
-            "Write a Markdown note to the Obsidian vault. Use this proactively to "
-            "save information worth remembering across conversations — decisions, "
-            "preferences, project state, people, research summaries. Prefer "
-            "mode='append' when adding to an existing topic; use mode='create' for "
-            "new notes (fails if file exists) and mode='overwrite' sparingly. "
-            "Only .md files are allowed. Parent directories are created automatically."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Vault-relative path ending in .md.",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Markdown content to write.",
-                },
-                "mode": {
-                    "type": "string",
-                    "enum": ["overwrite", "append", "create"],
-                    "description": (
-                        "'overwrite' replaces existing content; 'append' adds to end of "
-                        "existing file; 'create' fails if file exists. Defaults to 'overwrite'."
-                    ),
-                },
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "vault_list",
-        "description": (
-            "List entries under a vault directory (or the vault root if path is empty). "
-            "Returns a newline-separated list with 'd' for directories and 'f' for files. "
-            "Use this to discover what notes exist before reading specific ones."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Vault-relative directory path, or empty string for vault root.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "vault_search",
-        "description": (
-            "Search the vault for notes containing a substring. Case-insensitive. "
-            "Returns up to max_results matches with the file path and the matching line. "
-            "Use this when looking for information on a topic without knowing the exact "
-            "filename."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Substring to search for.",
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of matches to return. Defaults to 20.",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-]
 
 
 def _sync_list(root: Path, subpath: str) -> str:
@@ -209,14 +111,3 @@ class ObsidianTools:
 
     async def vault_search(self, query: str, max_results: int = 20) -> str:
         return await asyncio.to_thread(_sync_search, self.root, query, max_results)
-
-    async def dispatch(self, name: str, inputs: dict[str, Any]) -> str:
-        fn = getattr(self, name, None)
-        if fn is None or name not in {
-            "vault_read",
-            "vault_write",
-            "vault_list",
-            "vault_search",
-        }:
-            raise VaultError(f"unknown tool: {name}")
-        return await fn(**inputs)
