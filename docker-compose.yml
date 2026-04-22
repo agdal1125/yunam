@@ -68,8 +68,9 @@ services:
       - calendar-tokens:/home/nodejs/.config/google-calendar-mcp
     healthcheck:
       # nspady's node:18-alpine image has no `curl`, only busybox `wget`.
-      # `-q --spider` = HEAD-style check, no output, exit 0 on 2xx/3xx.
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/health || exit 1"]
+      # Use 127.0.0.1 explicitly — BusyBox resolves `localhost` via IPv6 first,
+      # and nspady binds IPv4-only (0.0.0.0), so ::1:3000 gets RST → false fail.
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

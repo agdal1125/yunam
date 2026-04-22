@@ -6,33 +6,39 @@ No inbound port is exposed to the host or internet.
 
 Key design choices:
 
-1. **Sorted tool discovery**. MCP `list_tools()` returns tools in insertion
-   order, which can shift across server versions. We sort by name before
-   flattening into ToolSpecs so the prompt-cache prefix stays byte-stable
-   across gateway restarts — a cache-flushing invariant from CLAUDE.md.
+1. **Raw httpx JSON-RPC** instead of the `mcp` Python SDK's ClientSession.
+   nspady runs in stateless mode (`sessionIdGenerator: undefined`), which
+   closes the SSE response stream after each POST. The SDK's ClientSession
+   treats that closure as a broken transport and any subsequent `send_request`
+   raises `anyio.BrokenResourceError`. Raw POSTs sidestep the abstraction
+   mismatch entirely — every call is an isolated HTTP request.
 
-2. **Optional skill**. The MCP URL comes from env; if unset, `main.py`
-   skips this skill entirely. If set but unreachable at boot, we fail fast
-   so misconfiguration is loud, not silent (per the MCP checklist).
+2. **Tool discovery at startup, cached thereafter**. `connect()` issues
+   `initialize` + `tools/list` once and caches the result. Subsequent tool
+   invocations are single `tools/call` POSTs — no re-discovery per turn.
 
-3. **Scope assignment is policy, not inference**. We explicitly classify
-   each nspady tool name into `calendar:read` vs `calendar:write` via a
-   prefix table. Unknown tool names default to read (safer than guessing
-   write) but log a warning for human review.
+3. **Sorted tool order**. We sort the discovered tools by name before flattening
+   into ToolSpecs so the prompt-cache prefix stays byte-stable across gateway
+   restarts — a cache-flushing invariant from CLAUDE.md.
 
-4. **Token ownership**. Refresh tokens live in the MCP server's own
-   Docker volume (`calendar-tokens`), not yunam.db. Accepted trade-off —
-   see `dev/milestones.md` M3 discussion.
+4. **Scope assignment is policy, not inference**. We explicitly classify each
+   nspady tool name into `calendar:read` vs `calendar:write` via a prefix
+   table. Unknown tool names default to read (safer than guessing write)
+   but log a warning for human review.
+
+5. **Token ownership**. Refresh tokens live in the MCP server's own Docker
+   volume (`calendar-tokens`), not yunam.db. Accepted trade-off — see
+   `dev/milestones.md` M3 discussion.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-from contextlib import AsyncExitStack
+import uuid
 from typing import Any
 
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+import httpx
 
 from ..capabilities import Scope
 from ..skills.base import DispatchContext, Skill, ToolSpec
@@ -43,6 +49,15 @@ logger = logging.getLogger(__name__)
 
 SKILL_ID = "gcal"
 SKILL_VERSION = "1"
+
+# MCP protocol version nspady advertises (as of 2026-04). Send this in
+# initialize so server + client agree on the wire format. Bumping this is a
+# deliberate policy decision — nspady may not support newer specs yet.
+PROTOCOL_VERSION = "2024-11-05"
+
+# Reasonable per-request timeout. Most Calendar MCP calls finish in < 2s;
+# a 30s ceiling tolerates slow Google API days without hanging Claude turns.
+DEFAULT_TIMEOUT_S = 30.0
 
 
 # nspady tool-name prefixes that mutate calendar state → need write scope.
@@ -93,102 +108,174 @@ surface the failure and suggest re-running the one-time OAuth bootstrap.
 
 
 class GCalMCPClient:
-    """Persistent streamable-http MCP client for the nspady calendar server.
+    """Raw-JSON-RPC client for nspady's streamable-http MCP endpoint.
 
-    Opens a single session at `connect()` (typically called from main.py
-    during gateway startup) and keeps it alive until `close()`. Thread-safe
-    within a single asyncio event loop — don't share across loops.
+    Stateless: each MCP method is sent as an independent POST. No SSE
+    stream is kept open between calls. Construct once, call `connect()` at
+    gateway startup to populate the tool cache, use `call_tool()` per turn.
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, timeout_s: float = DEFAULT_TIMEOUT_S):
         self._url = url
-        self._exit_stack: AsyncExitStack | None = None
-        self._session: ClientSession | None = None
-        self._tools: tuple[Any, ...] = ()
+        self._timeout_s = timeout_s
+        self._http: httpx.AsyncClient | None = None
+        self._tools: tuple[dict[str, Any], ...] = ()
 
     async def connect(self) -> None:
-        """Establish the MCP session and discover tools. Raises on failure.
+        """Initialize the server side and cache its tool list.
 
-        Callers decide fail-open vs fail-fast — main.py fails fast, so
-        misconfigured gateways crash at boot rather than silently missing
-        a skill.
+        Failing here crashes the gateway at boot (see main.py) — better to
+        surface misconfiguration loudly than silently serve without calendar.
         """
-        if self._session is not None:
+        if self._http is not None:
             raise RuntimeError("GCalMCPClient already connected")
-        stack = AsyncExitStack()
+        self._http = httpx.AsyncClient(timeout=self._timeout_s)
         try:
-            transport = await stack.enter_async_context(streamablehttp_client(self._url))
-            read_stream, write_stream, _ = transport
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
-            listed = await session.list_tools()
+            await self._rpc(
+                "initialize",
+                {
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "yunam-gateway", "version": "1"},
+                },
+            )
+            listed = await self._rpc("tools/list", {})
         except Exception:
-            await stack.aclose()
+            await self._http.aclose()
+            self._http = None
             raise
+        raw_tools = listed.get("tools", []) if isinstance(listed, dict) else []
         # Sort by name for prompt-cache prefix stability (CLAUDE.md invariant).
-        self._tools = tuple(sorted(listed.tools, key=lambda t: t.name))
-        self._session = session
-        self._exit_stack = stack
+        self._tools = tuple(sorted(raw_tools, key=lambda t: t.get("name", "")))
         logger.info(
             "gcal MCP connected url=%s tools=%d (%s)",
             self._url,
             len(self._tools),
-            ", ".join(t.name for t in self._tools[:8])
+            ", ".join(t.get("name", "?") for t in self._tools[:8])
             + ("..." if len(self._tools) > 8 else ""),
         )
 
     async def close(self) -> None:
-        if self._exit_stack is None:
+        if self._http is None:
             return
         try:
-            await self._exit_stack.aclose()
+            await self._http.aclose()
         except Exception:
-            logger.exception("gcal MCP close raised")
+            logger.exception("gcal MCP http close raised")
         finally:
-            self._exit_stack = None
-            self._session = None
+            self._http = None
             self._tools = ()
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """Invoke an MCP tool and return its content as a string.
+        """Invoke an MCP tool by name. Returns the tool's content as text.
 
-        Exceptions are re-raised as VaultError so the orchestrator surfaces
-        a clean tool-error message to Claude instead of a 500.
+        Raises VaultError on transport/protocol failure so the orchestrator
+        surfaces a clean tool-error to Claude (per the governance layer).
         """
-        if self._session is None:
+        if self._http is None:
             raise VaultError("gcal MCP client is not connected")
         try:
-            result = await self._session.call_tool(name, arguments)
+            result = await self._rpc(
+                "tools/call",
+                {"name": name, "arguments": arguments},
+            )
         except Exception as e:
             logger.info("gcal call_tool %s failed: %r", name, e)
             raise VaultError(f"gcal MCP error ({name}): {e}") from e
-        text = _stringify_content(result.content)
-        if getattr(result, "isError", False):
+        if not isinstance(result, dict):
+            return str(result)
+        text = _stringify_content(result.get("content"))
+        if result.get("isError"):
             return f"Tool error: {text}"
         return text
 
     @property
-    def tools(self) -> tuple[Any, ...]:
+    def tools(self) -> tuple[dict[str, Any], ...]:
         return self._tools
+
+    async def _rpc(self, method: str, params: dict[str, Any]) -> Any:
+        """Send one JSON-RPC request and return the `result` field.
+
+        nspady responds with a text/event-stream-shaped body even for a
+        single request (one `event: message` frame with `data: {...}`).
+        We parse either SSE or plain JSON transparently.
+        """
+        assert self._http is not None
+        request_id = uuid.uuid4().hex
+        response = await self._http.post(
+            self._url,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            },
+            headers={
+                "Content-Type": "application/json",
+                # nspady only responds if the client advertises SSE acceptance.
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        response.raise_for_status()
+        payload = _parse_mcp_response(response.text)
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"unexpected MCP response shape: {type(payload).__name__}")
+        if "error" in payload:
+            err = payload["error"]
+            raise RuntimeError(
+                f"MCP error: code={err.get('code')} msg={err.get('message')!r}"
+            )
+        return payload.get("result")
+
+
+def _parse_mcp_response(body: str) -> Any:
+    """Parse either raw JSON or SSE-framed JSON response from nspady.
+
+    SSE frame shape:
+        event: message
+        data: {"jsonrpc":"2.0","id":...,"result":...}
+    """
+    body = body.strip()
+    if not body:
+        raise RuntimeError("empty MCP response body")
+    if body.startswith("{") or body.startswith("["):
+        return json.loads(body)
+    # SSE path: last `data:` line wins (server may send multiple events).
+    data_line: str | None = None
+    for line in body.splitlines():
+        if line.startswith("data:"):
+            data_line = line[len("data:"):].strip()
+    if data_line is None:
+        raise RuntimeError(f"no JSON payload in MCP response: {body[:200]!r}")
+    return json.loads(data_line)
 
 
 def _stringify_content(content: Any) -> str:
     """Flatten MCP content blocks to a single string for tool_result.
 
-    MCP content is usually a list of TextContent objects each with a `text`
-    attribute; guard for ImageContent / EmbeddedResource by stringifying.
+    Content is usually a list of `{type: "text", text: "..."}` blocks.
+    Non-text blocks (image, embedded resource) get a `str()` fallback.
     """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
+    if not isinstance(content, list):
+        return str(content)
     parts: list[str] = []
     for block in content:
-        text = getattr(block, "text", None)
-        if text is not None:
-            parts.append(text)
+        if isinstance(block, dict):
+            text = block.get("text")
+            if text is not None:
+                parts.append(str(text))
+                continue
+            parts.append(json.dumps(block, ensure_ascii=False))
         else:
-            parts.append(str(block))
+            text = getattr(block, "text", None)
+            if text is not None:
+                parts.append(str(text))
+            else:
+                parts.append(str(block))
     return "\n".join(parts).strip()
 
 
@@ -205,7 +292,10 @@ def build_gcal_mcp_skill(client: GCalMCPClient) -> Skill:
 
     specs: list[ToolSpec] = []
     for mcp_tool in client.tools:
-        name = mcp_tool.name
+        name = mcp_tool.get("name", "")
+        if not name:
+            logger.warning("gcal MCP tool missing name, skipping: %r", mcp_tool)
+            continue
         scope = _scope_for(name)
         if scope == Scope.CALENDAR_READ and any(
             kw in name for kw in ("create", "update", "delete", "respond", "manage")
@@ -221,8 +311,8 @@ def build_gcal_mcp_skill(client: GCalMCPClient) -> Skill:
 
         schema = {
             "name": name,
-            "description": mcp_tool.description or "",
-            "input_schema": mcp_tool.inputSchema
+            "description": mcp_tool.get("description") or "",
+            "input_schema": mcp_tool.get("inputSchema")
             or {"type": "object", "properties": {}},
         }
 

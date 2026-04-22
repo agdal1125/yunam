@@ -88,11 +88,15 @@ def _test_skill_composition_with_mock() -> None:
     from yunam.mcp.gcal import build_gcal_mcp_skill
     from yunam.skills.base import SkillRegistry
 
-    class _MockMCPTool:
-        def __init__(self, name: str, description: str = "stub"):
-            self.name = name
-            self.description = description
-            self.inputSchema = {"type": "object", "properties": {}}
+    # After the raw-httpx rewrite, GCalMCPClient caches tools as dicts
+    # (shape returned by `tools/list` JSON-RPC: {name, description, inputSchema}).
+    # Mock mirrors that shape — not the mcp SDK's attribute-style Tool objects.
+    def _mock_tool(name: str) -> dict:
+        return {
+            "name": name,
+            "description": "stub",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
 
     class _MockClient:
         def __init__(self):
@@ -100,9 +104,7 @@ def _test_skill_composition_with_mock() -> None:
                 NSPADY_TOOLS_EXPECTED["read"] + NSPADY_TOOLS_EXPECTED["write"]
             )
             # Pre-sorted, matching what GCalMCPClient.connect() would produce.
-            self.tools = tuple(
-                _MockMCPTool(n) for n in sorted(all_names)
-            )
+            self.tools = tuple(_mock_tool(n) for n in sorted(all_names))
 
         async def call_tool(self, name, arguments):  # pragma: no cover
             return f"(mock) {name} called"
@@ -143,7 +145,7 @@ async def _test_live_if_configured() -> None:
         print(f"       ⚠ connect() failed: {e!r}")
         return
     try:
-        discovered = [t.name for t in client.tools]
+        discovered = [t["name"] for t in client.tools]
         print(f"       ✓ connected, discovered {len(discovered)} tools")
         print(f"         names: {', '.join(discovered)}")
         # Try a harmless read-only call if list-calendars is present.
