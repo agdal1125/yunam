@@ -1,26 +1,31 @@
 # Override used ONLY during the one-time Google OAuth consent flow.
 #
-# Normal operation (docker-compose.yml alone) keeps calendar-mcp purely on the
-# internal Docker network — zero inbound ports. Safe, but it prevents the
-# browser from reaching the OAuth landing UI at http://calendar-mcp:3000/.
+# WHY network_mode: host + HOST=localhost:
+# nspady builds the OAuth redirect URI from the HOST env var literally:
+#   http://${HOST}:${PORT}/oauth2callback
+# For runtime we use HOST=0.0.0.0 so yunam-gateway can reach calendar-mcp
+# via the docker network. But Google OAuth REJECTS `0.0.0.0` as a redirect
+# URI host (Desktop-app policy: only `localhost` and `127.0.0.1` allowed).
 #
-# In nspady's HTTP mode, port 3000 handles EVERYTHING for the OAuth flow:
-#   GET /                  → account-management UI
-#   POST /api/accounts     → returns Google OAuth URL
-#   GET /oauth2callback    → catches Google's code redirect
+# Using `network_mode: host` during consent sidesteps the conflict:
+#   - Container binds directly to VPS host's network stack, so HOST=localhost
+#     makes nspady listen on VPS localhost (not the docker bridge).
+#   - SSH tunnel (`ssh -L 3000:localhost:3000 yunam`) reaches VPS localhost
+#     straight, no NAT, no port-publishing needed.
+#   - Redirect URI becomes `http://localhost:3000/oauth2callback` — Google accepts.
 #
-# Ports 3500-3505 are NOT used in HTTP mode (they're stdio / CLI only), so
-# we only publish 3000 here — bound to 127.0.0.1 so the OAuth endpoint
-# isn't exposed to the open internet. Access from laptop is via SSH tunnel:
-#   ssh -N -L 3000:localhost:3000 yunam
-# Then open http://localhost:3000/ in the laptop browser.
-#
-# After the token lands in `calendar-tokens`, stop this override and
-# restart normally:
+# After consent saves the token into the `calendar-tokens` volume, stop this
+# override and switch back to the bridge-network runtime mode:
 #   docker compose --profile gcal down
 #   docker compose --profile gcal up -d --build
 
 services:
   calendar-mcp:
-    ports:
-      - "127.0.0.1:3000:3000"
+    network_mode: host
+    environment:
+      - HOST=localhost
+    # Port publishing is irrelevant under host networking — the container IS
+    # the host from a networking standpoint. Explicitly clear the base
+    # compose's expose/port settings just for clarity.
+    ports: !reset []
+    healthcheck: !reset null
