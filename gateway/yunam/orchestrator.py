@@ -9,18 +9,25 @@ See /Users/nowgeun/.claude/plans/velvet-swimming-koala.md for the full design.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Protocol, TypedDict
 from zoneinfo import ZoneInfo
 
 from langgraph.graph import END, START, StateGraph
 
+from .context_primer import build_preference_context
 from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
 from .skills.base import DispatchContext, SkillRegistry
 from .tools.vault import VaultError
+
+
+class _TextEmbedder(Protocol):
+    async def embed_text_document(self, text: str) -> list[float]: ...  # noqa: E704
 
 logger = logging.getLogger("yunam.orchestrator")
 
@@ -91,6 +98,8 @@ class Orchestrator:
         registry: SkillRegistry,
         timezone: str = "Asia/Seoul",
         *,
+        vault_path: Path | None = None,
+        embedder: _TextEmbedder | None = None,
         model: str = DEFAULT_MODEL,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: dict[str, Any] | None = None,
@@ -100,10 +109,16 @@ class Orchestrator:
         self._store = store
         self._registry = registry
         self._tz = ZoneInfo(timezone)
+        self._vault_path = vault_path
+        self._embedder = embedder
         self._model = model
         self._max_tokens = max_tokens
         self._thinking = thinking
         self._output_config = output_config
+        # Background embed tasks are tracked so the asyncio runtime keeps a
+        # strong reference to them (otherwise they may be GC'd mid-flight).
+        # The done-callback self-unregisters.
+        self._bg_tasks: set[asyncio.Task[None]] = set()
         # Compose the system prompt and tool-schemas list exactly once, in the
         # registry's declared skill order. Both must be byte-stable across
         # turns for Anthropic's prompt cache to keep hitting.
@@ -147,11 +162,16 @@ class Orchestrator:
 
     async def _agent_step_node(self, state: AgentState) -> dict[str, Any]:
         messages: list[dict[str, Any]] = list(state["history"])
-        # Per-turn date context goes in the user message, never the system prompt —
-        # otherwise every day invalidates the cached prefix.
+        # Per-turn context (date, preferences) goes in the user message, never
+        # the system prompt — otherwise every edit to a preferences file or
+        # change of day would invalidate the cached prefix.
         now_local = datetime.now(self._tz)
         date_tag = now_local.strftime("%Y-%m-%d %H:%M %Z")
-        wrapped = f"[meta: now is {date_tag}]\n\n{state['user_text']}"
+        primer = await build_preference_context(state["user_text"], self._vault_path)
+        prelude = f"[meta: now is {date_tag}]"
+        if primer:
+            prelude = f"{prelude}\n\n{primer}"
+        wrapped = f"{prelude}\n\n{state['user_text']}"
         messages.append({"role": "user", "content": wrapped})
 
         tool_calls_log: list[ToolCall] = []
@@ -286,10 +306,42 @@ class Orchestrator:
         return {"response_text": response_text, "tool_calls": tool_calls_log}
 
     async def _persist_node(self, state: AgentState) -> dict[str, Any]:
-        await self._store.persist_turn(
+        user_msg_id, assistant_msg_id = await self._store.persist_turn(
             chat_id=state["chat_id"],
             user_text=state["user_text"],
             assistant_text=state["response_text"],
             tool_calls=state["tool_calls"],
         )
+        # Fire-and-forget embed of the combined turn. Keeps Telegram reply
+        # latency unchanged; on failure the turn exists in DB but isn't
+        # searchable by `recall` (logged at warning).
+        if self._embedder is not None:
+            task = asyncio.create_task(
+                self._embed_turn_bg(
+                    assistant_msg_id=assistant_msg_id,
+                    user_text=state["user_text"],
+                    assistant_text=state["response_text"],
+                ),
+                name=f"yunam-embed-{assistant_msg_id}",
+            )
+            self._bg_tasks.add(task)
+            task.add_done_callback(self._bg_tasks.discard)
         return {}
+
+    async def _embed_turn_bg(
+        self,
+        *,
+        assistant_msg_id: int,
+        user_text: str,
+        assistant_text: str,
+    ) -> None:
+        """Embed a just-persisted turn. Any failure is logged and swallowed."""
+        try:
+            combined = f"[user] {user_text}\n\n[assistant] {assistant_text}"
+            vector = await self._embedder.embed_text_document(combined)  # type: ignore[union-attr]
+            await self._store.record_message_embedding(assistant_msg_id, vector)
+        except Exception:
+            logger.warning(
+                "background embed failed for assistant_msg_id=%s",
+                assistant_msg_id, exc_info=True,
+            )

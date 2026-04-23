@@ -13,6 +13,9 @@ stabilizes its own cache on first use.
 
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
 from ..orchestrator import Orchestrator
 from ..sessions import SessionStore
 from ..skills.base import SkillRegistry
@@ -28,6 +31,9 @@ def build_deep_think_orchestrator(
     store: SessionStore,
     registry: SkillRegistry,
     timezone: str = "Asia/Seoul",
+    *,
+    vault_path: Path | None = None,
+    embedder: Any | None = None,
 ) -> Orchestrator:
     """Build a deep-think Orchestrator (Opus 4.7 + adaptive thinking / high effort).
 
@@ -40,6 +46,8 @@ def build_deep_think_orchestrator(
         store,
         registry,
         timezone=timezone,
+        vault_path=vault_path,
+        embedder=embedder,
         model=DEEP_THINK_MODEL,
         max_tokens=DEEP_THINK_MAX_TOKENS,
         thinking={"type": "adaptive"},

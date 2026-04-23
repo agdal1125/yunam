@@ -110,6 +110,25 @@ class VoyageEmbedder:
             raise EmbeddingError("voyage returned no embeddings")
         return list(vectors[0])
 
+    async def embed_text_document(self, text: str) -> list[float]:
+        """Embed arbitrary text with `input_type='document'` (for indexing).
+
+        Symmetric partner to `embed_query`. Use this for conversation turns,
+        vault notes, or any text we're storing in a vec0 table for later KNN.
+        """
+        try:
+            result = await self._client.multimodal_embed(
+                inputs=[[text]],
+                model=EMBED_MODEL,
+                input_type="document",
+            )
+        except Exception as e:
+            raise EmbeddingError(f"voyage text-document embed failed: {e}") from e
+        vectors = getattr(result, "embeddings", None)
+        if not vectors:
+            raise EmbeddingError("voyage returned no embeddings")
+        return list(vectors[0])
+
 
 def _text_parts(filename: str, caption: str | None, description: str | None) -> str:
     """Build the text portion of a multimodal input from file metadata."""

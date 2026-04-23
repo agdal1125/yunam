@@ -32,7 +32,11 @@ from yunam.config import Config, configure_logging, load_config
 from yunam.embeddings import VoyageEmbedder
 from yunam.orchestrator import Orchestrator
 from yunam.prompts import DAILY_PROMPT_TEMPLATE
-from yunam.scheduler import run_daily_scheduler
+from yunam.scheduler import (
+    now_utc_iso,
+    run_daily_scheduler,
+    run_nudge_sweeper,
+)
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
 from yunam.mcp import GCalMCPClient, build_gcal_mcp_skill
@@ -41,15 +45,21 @@ from yunam.skills import (
     SkillRegistry,
     build_airquality_skill,
     build_files_skill,
+    build_memory_skill,
+    build_obsidian_graph_skill,
     build_obsidian_skill,
     build_parcel_skill,
+    build_reminders_skill,
     build_web_skill,
 )
 from yunam.subagents import build_deep_think_orchestrator
 from yunam.tools.airquality import AirQualityTools
 from yunam.tools.attachments import AttachmentTools
+from yunam.tools.memory import MemoryTools
 from yunam.tools.obsidian import ObsidianTools
+from yunam.tools.obsidian_graph import ObsidianGraphTools
 from yunam.tools.parcel import ParcelTools
+from yunam.tools.reminders import ReminderTools
 from yunam.tools.web import WebTools
 
 load_dotenv()
@@ -343,6 +353,9 @@ async def _run() -> None:
     web_tools = WebTools(jina_api_key=cfg.jina_api_key)
     airquality_tools = AirQualityTools()
     parcel_tools = ParcelTools(api_key=cfg.sweettracker_api_key)
+    reminder_tools = ReminderTools(store=store, timezone_name=cfg.timezone)
+    memory_tools = MemoryTools(store=store, embedder=embedder, timezone_name=cfg.timezone)
+    graph_tools = ObsidianGraphTools(vault_root=cfg.vault_path)
 
     # Optional: connect to the Google Calendar MCP sibling container. If the
     # URL is unset we skip the skill entirely (dev-time or pre-OAuth state).
@@ -359,9 +372,9 @@ async def _run() -> None:
         logger.info("YUNAM_GCAL_MCP_URL unset — gcal skill disabled")
 
     # Skill order is a prompt-cache-affecting invariant — the flattened tool
-    # list Claude sees is [obsidian, files, web, airquality, parcel, gcal?],
-    # and the concatenated system prompt mirrors that order. Don't reshuffle
-    # casually — new skills go at the end.
+    # list Claude sees is [obsidian, files, web, airquality, parcel, gcal?,
+    # reminders, memory, obsidian_graph], and the concatenated system prompt
+    # mirrors that order. Don't reshuffle casually — new skills go at the end.
     skills: list[Skill] = [
         build_obsidian_skill(tools),
         build_files_skill(attachments),
@@ -371,12 +384,23 @@ async def _run() -> None:
     ]
     if gcal_skill is not None:
         skills.append(gcal_skill)
+    skills.append(build_reminders_skill(reminder_tools))
+    skills.append(build_memory_skill(memory_tools))
+    skills.append(build_obsidian_graph_skill(graph_tools))
     registry = SkillRegistry(skills)
-    orch = Orchestrator(claude_client, store, registry, timezone=cfg.timezone)
+    orch = Orchestrator(
+        claude_client, store, registry,
+        timezone=cfg.timezone,
+        vault_path=cfg.vault_path,
+        embedder=embedder,
+    )
     # Deep-think path (Opus 4.7 + adaptive / high effort) — only invoked via
     # the /think command, never by the main agent autonomously.
     deep_orch = build_deep_think_orchestrator(
-        claude_client, store, registry, timezone=cfg.timezone
+        claude_client, store, registry,
+        timezone=cfg.timezone,
+        vault_path=cfg.vault_path,
+        embedder=embedder,
     )
 
     app.bot_data["cfg"] = cfg
@@ -408,6 +432,25 @@ async def _run() -> None:
         # Record so the user's reply loads this prompt as prior assistant context.
         await store.record_proactive_message(chat_id, text)
 
+    async def _sweep_nudges() -> None:
+        """Deliver any due reminders. Called every nudge_sweep_interval_seconds."""
+        due = await store.list_due_nudges(now_utc_iso())
+        if not due:
+            return
+        logger.info("nudge sweeper: %d due", len(due))
+        for nudge in due:
+            try:
+                await app.bot.send_message(
+                    chat_id=nudge.chat_id, text=nudge.message[:TELEGRAM_MSG_LIMIT]
+                )
+                # Record so history shows the proactive nudge as prior context.
+                await store.record_proactive_message(nudge.chat_id, nudge.message)
+                await store.mark_nudge_sent(nudge.id)
+                logger.info("nudge sweeper: fired id=%s chat_id=%s", nudge.id, nudge.chat_id)
+            except Exception:
+                # Don't mark sent on failure — next sweep will retry.
+                logger.exception("nudge sweeper: failed to dispatch id=%s", nudge.id)
+
     def _on_signal(sig_name: str) -> None:
         logger.info("signal %s received; shutting down", sig_name)
         stop_event.set()
@@ -420,7 +463,7 @@ async def _run() -> None:
             # Signal handlers aren't available on Windows; fine to skip.
             pass
 
-    scheduler_task: asyncio.Task[None] | None = None
+    scheduler_tasks: list[asyncio.Task[None]] = []
     try:
         await app.initialize()
         await app.start()
@@ -428,7 +471,7 @@ async def _run() -> None:
         logger.info("gateway running")
 
         if cfg.schedule_enabled:
-            scheduler_task = asyncio.create_task(
+            scheduler_tasks.append(asyncio.create_task(
                 run_daily_scheduler(
                     chat_id=cfg.allowed_user_id,
                     hour=cfg.daily_reflection_hour,
@@ -438,21 +481,33 @@ async def _run() -> None:
                     stop_event=stop_event,
                 ),
                 name="yunam-daily-scheduler",
-            )
+            ))
         else:
-            logger.info("scheduler disabled (YUNAM_SCHEDULE_ENABLED is not set)")
+            logger.info("daily retrospective disabled (YUNAM_SCHEDULE_ENABLED is not set)")
+
+        if cfg.nudge_sweeper_enabled:
+            scheduler_tasks.append(asyncio.create_task(
+                run_nudge_sweeper(
+                    on_sweep=_sweep_nudges,
+                    stop_event=stop_event,
+                    interval_seconds=cfg.nudge_sweep_interval_seconds,
+                ),
+                name="yunam-nudge-sweeper",
+            ))
+        else:
+            logger.info("nudge sweeper disabled (YUNAM_NUDGE_SWEEPER_ENABLED is not set)")
 
         await stop_event.wait()
     finally:
         logger.info("gateway stopping")
-        if scheduler_task is not None:
+        for task in scheduler_tasks:
             try:
-                await asyncio.wait_for(scheduler_task, timeout=5.0)
+                await asyncio.wait_for(task, timeout=5.0)
             except asyncio.TimeoutError:
-                logger.warning("scheduler did not exit within 5s; cancelling")
-                scheduler_task.cancel()
+                logger.warning("%s did not exit within 5s; cancelling", task.get_name())
+                task.cancel()
             except Exception:
-                logger.exception("scheduler task raised on shutdown")
+                logger.exception("%s raised on shutdown", task.get_name())
         try:
             await app.updater.stop()
         except Exception:

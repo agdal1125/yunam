@@ -83,6 +83,36 @@ CREATE TABLE IF NOT EXISTS saved_files (
     created_at      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_saved_files_chat ON saved_files(chat_id, created_at DESC);
+
+-- Proactive reminders Yunam has scheduled for itself (via the reminders skill).
+-- Sweeper polls `fire_at` vs. now and dispatches due rows as Telegram messages.
+CREATE TABLE IF NOT EXISTS scheduled_nudges (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    fire_at     TEXT NOT NULL,          -- ISO 8601 UTC
+    message     TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    sent_at     TEXT,                   -- NULL until dispatched; idempotency marker
+    cancelled_at TEXT                   -- NULL unless jaekeun cancels before firing
+);
+CREATE INDEX IF NOT EXISTS idx_nudges_due
+    ON scheduled_nudges(fire_at)
+    WHERE sent_at IS NULL AND cancelled_at IS NULL;
+
+-- Conversation-turn index. One row per user→assistant exchange, keyed by the
+-- assistant message id. The combined text is stored here (duplicated from
+-- `messages`) so recall is one JOIN instead of a correlated subquery walking
+-- `messages` to reconstruct turn pairs. Vector lives in `message_embeddings`.
+CREATE TABLE IF NOT EXISTS message_turns (
+    assistant_message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    chat_id              INTEGER NOT NULL,
+    user_message_id      INTEGER NOT NULL REFERENCES messages(id),
+    user_text            TEXT NOT NULL,
+    assistant_text       TEXT NOT NULL,
+    created_at           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_turns_chat_created
+    ON message_turns(chat_id, created_at DESC);
 """
 
 # Voyage `voyage-multimodal-3` returns 1024-dim float vectors.
@@ -96,6 +126,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS file_embeddings USING vec0(
     file_id INTEGER PRIMARY KEY,
     embedding float[{EMBEDDING_DIM}]
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS message_embeddings USING vec0(
+    assistant_message_id INTEGER PRIMARY KEY,
+    embedding float[{EMBEDDING_DIM}]
+);
 """
 
 HISTORY_LIMIT = 20
@@ -103,7 +137,7 @@ HISTORY_LIMIT = 20
 # Schema version — bump when a migration is added below, and gate the new step
 # on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
 # must be idempotent.
-DB_USER_VERSION = 2
+DB_USER_VERSION = 4
 
 
 async def _column_exists(
@@ -193,6 +227,25 @@ class SavedFile:
     caption: str | None
     description: str | None
     created_at: str
+
+
+@dataclass(frozen=True)
+class ScheduledNudge:
+    id: int
+    chat_id: int
+    fire_at: str          # ISO 8601 UTC
+    message: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class RecalledTurn:
+    assistant_message_id: int
+    chat_id: int
+    user_text: str
+    assistant_text: str
+    created_at: str
+    distance: float
 
 
 class SessionStore:
@@ -295,8 +348,13 @@ class SessionStore:
         user_text: str,
         assistant_text: str,
         tool_calls: list[ToolCall],
-    ) -> None:
-        """Write one full turn (user + assistant + tool calls) as a single transaction."""
+    ) -> tuple[int, int]:
+        """Write one full turn (user + assistant + tool calls + turn index) atomically.
+
+        Returns `(user_message_id, assistant_message_id)` so the caller can
+        schedule a background embedding task keyed to the assistant message.
+        Does not embed — that's the orchestrator's job.
+        """
         db = self._conn
         now = _now_iso()
         await db.execute("BEGIN")
@@ -309,15 +367,26 @@ class SessionStore:
                 """,
                 (chat_id, now, now),
             )
-            await db.execute(
+            async with db.execute(
                 "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
                 (chat_id, user_text, now),
-            )
+            ) as cur:
+                user_msg_id = cur.lastrowid
             async with db.execute(
                 "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
                 (chat_id, assistant_text, now),
             ) as cur:
                 assistant_msg_id = cur.lastrowid
+            await db.execute(
+                """
+                INSERT INTO message_turns
+                    (assistant_message_id, chat_id, user_message_id,
+                     user_text, assistant_text, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (assistant_msg_id, chat_id, user_msg_id,
+                 user_text, assistant_text, now),
+            )
 
             if tool_calls:
                 await db.executemany(
@@ -348,6 +417,7 @@ class SessionStore:
         except Exception:
             await db.rollback()
             raise
+        return user_msg_id, assistant_msg_id
 
     # ---- pending attachments ---------------------------------------------
 
@@ -482,6 +552,149 @@ class SessionStore:
             )
             out.append((sf, float(row[10])))
         return out
+
+    # ---- scheduled nudges ------------------------------------------------
+
+    async def add_nudge(
+        self, *, chat_id: int, fire_at_iso_utc: str, message: str
+    ) -> int:
+        """Insert a nudge row and return its id. `fire_at_iso_utc` must be UTC ISO 8601."""
+        db = self._conn
+        now = _now_iso()
+        async with db.execute(
+            """
+            INSERT INTO scheduled_nudges (chat_id, fire_at, message, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (chat_id, fire_at_iso_utc, message, now),
+        ) as cur:
+            new_id = cur.lastrowid
+        await db.commit()
+        return new_id
+
+    async def list_due_nudges(self, now_iso_utc: str) -> list[ScheduledNudge]:
+        """Return all un-sent, un-cancelled nudges with fire_at <= now."""
+        db = self._conn
+        async with db.execute(
+            """
+            SELECT id, chat_id, fire_at, message, created_at
+            FROM scheduled_nudges
+            WHERE sent_at IS NULL AND cancelled_at IS NULL AND fire_at <= ?
+            ORDER BY fire_at ASC
+            """,
+            (now_iso_utc,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [ScheduledNudge(*row) for row in rows]
+
+    async def list_pending_nudges(self, chat_id: int) -> list[ScheduledNudge]:
+        """Return upcoming (not-yet-fired, not-cancelled) nudges for a chat."""
+        db = self._conn
+        async with db.execute(
+            """
+            SELECT id, chat_id, fire_at, message, created_at
+            FROM scheduled_nudges
+            WHERE chat_id = ? AND sent_at IS NULL AND cancelled_at IS NULL
+            ORDER BY fire_at ASC
+            """,
+            (chat_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [ScheduledNudge(*row) for row in rows]
+
+    async def mark_nudge_sent(self, nudge_id: int) -> None:
+        db = self._conn
+        await db.execute(
+            "UPDATE scheduled_nudges SET sent_at = ? WHERE id = ? AND sent_at IS NULL",
+            (_now_iso(), nudge_id),
+        )
+        await db.commit()
+
+    # ---- conversation-memory embeddings ----------------------------------
+
+    async def record_message_embedding(
+        self, assistant_message_id: int, embedding: list[float]
+    ) -> None:
+        """Store the embedding for an already-persisted turn.
+
+        No-op if sqlite-vec isn't loaded (dev environments without the
+        extension). On failure, logs and swallows — memory recall is a
+        nice-to-have, not load-bearing.
+        """
+        if not self._has_vec:
+            return
+        try:
+            await self._conn.execute(
+                "INSERT INTO message_embeddings (assistant_message_id, embedding) VALUES (?, ?)",
+                (assistant_message_id, _pack_embedding(embedding)),
+            )
+            await self._conn.commit()
+        except Exception:
+            logger.exception(
+                "failed to store message embedding for assistant_msg_id=%s",
+                assistant_message_id,
+            )
+
+    async def search_messages_semantic(
+        self,
+        chat_id: int,
+        query_embedding: list[float],
+        limit: int = 5,
+    ) -> list[RecalledTurn]:
+        """KNN over embedded turns, scoped to a single chat.
+
+        Returns `RecalledTurn` ordered by ascending distance. Empty list if
+        sqlite-vec isn't loaded or the chat has no embedded turns yet.
+        """
+        if not self._has_vec:
+            return []
+        db = self._conn
+        packed = _pack_embedding(query_embedding)
+        # Over-fetch from vec0 then filter by chat_id — vec0 doesn't natively
+        # support WHERE predicates beyond MATCH + k, and our scale is tiny.
+        overfetch_k = max(limit * 4, 20)
+        async with db.execute(
+            f"""
+            SELECT t.assistant_message_id, t.chat_id, t.user_text, t.assistant_text,
+                   t.created_at, me.distance
+            FROM message_embeddings me
+            JOIN message_turns t ON t.assistant_message_id = me.assistant_message_id
+            WHERE me.embedding MATCH ? AND k = {int(overfetch_k)}
+              AND t.chat_id = ?
+            ORDER BY me.distance
+            LIMIT ?
+            """,
+            (packed, chat_id, int(limit)),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            RecalledTurn(
+                assistant_message_id=row[0],
+                chat_id=row[1],
+                user_text=row[2],
+                assistant_text=row[3],
+                created_at=row[4],
+                distance=float(row[5]),
+            )
+            for row in rows
+        ]
+
+    async def cancel_nudge(self, nudge_id: int, chat_id: int) -> bool:
+        """Cancel a pending nudge. Scoped to chat_id so one user can't cancel another's.
+        Returns True if a row was cancelled, False if none matched or already fired.
+        """
+        db = self._conn
+        async with db.execute(
+            """
+            UPDATE scheduled_nudges
+            SET cancelled_at = ?
+            WHERE id = ? AND chat_id = ? AND sent_at IS NULL AND cancelled_at IS NULL
+            """,
+            (_now_iso(), nudge_id, chat_id),
+        ) as cur:
+            changed = cur.rowcount or 0
+        await db.commit()
+        return changed > 0
 
     async def get_saved_file_by_relpath(self, relpath: str) -> SavedFile | None:
         db = self._conn

@@ -28,6 +28,9 @@ class Scope(str, Enum):
     PARCEL_READ = "parcel:read"
     CALENDAR_READ = "calendar:read"
     CALENDAR_WRITE = "calendar:write"
+    REMINDER_SCHEDULE = "reminder:schedule"
+    MEMORY_READ = "memory:read"
+    VAULT_GRAPH = "vault:graph"
 
     def __str__(self) -> str:
         return self.value
