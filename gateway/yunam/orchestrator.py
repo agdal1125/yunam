@@ -44,6 +44,7 @@ DEFAULT_MAX_TOKENS = 4096
 class AgentState(TypedDict):
     chat_id: int
     user_text: str
+    user_content: list[dict[str, Any]] | None
     history: list[dict[str, Any]]
     response_text: str
     tool_calls: list[ToolCall]
@@ -143,10 +144,17 @@ class Orchestrator:
         builder.add_edge("persist", END)
         return builder.compile()
 
-    async def handle_turn(self, chat_id: int, user_text: str) -> str:
+    async def handle_turn(
+        self,
+        chat_id: int,
+        user_text: str,
+        *,
+        user_content: list[dict[str, Any]] | None = None,
+    ) -> str:
         initial: AgentState = {
             "chat_id": chat_id,
             "user_text": user_text,
+            "user_content": user_content,
             "history": [],
             "response_text": "",
             "tool_calls": [],
@@ -172,7 +180,18 @@ class Orchestrator:
         if primer:
             prelude = f"{prelude}\n\n{primer}"
         wrapped = f"{prelude}\n\n{state['user_text']}"
-        messages.append({"role": "user", "content": wrapped})
+        if state.get("user_content"):
+            turn_content = list(state["user_content"] or [])
+            if turn_content and turn_content[0].get("type") == "text":
+                turn_content[0] = {
+                    **turn_content[0],
+                    "text": f"{prelude}\n\n{turn_content[0].get('text', '')}",
+                }
+            else:
+                turn_content.insert(0, {"type": "text", "text": wrapped})
+            messages.append({"role": "user", "content": turn_content})
+        else:
+            messages.append({"role": "user", "content": wrapped})
 
         tool_calls_log: list[ToolCall] = []
         final_response: Any = None

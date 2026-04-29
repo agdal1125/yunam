@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS pending_attachments (
     chat_id         INTEGER NOT NULL,
     file_id         TEXT NOT NULL,
     file_unique_id  TEXT,
+    media_group_id  TEXT,
     kind            TEXT NOT NULL,   -- photo/document/video/voice/audio/animation
     file_name       TEXT,
     mime_type       TEXT,
@@ -137,7 +138,7 @@ HISTORY_LIMIT = 20
 # Schema version — bump when a migration is added below, and gate the new step
 # on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
 # must be idempotent.
-DB_USER_VERSION = 4
+DB_USER_VERSION = 5
 
 
 async def _column_exists(
@@ -167,6 +168,11 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             await db.execute("ALTER TABLE tool_calls ADD COLUMN skill_id TEXT")
         if not await _column_exists(db, "tool_calls", "scope"):
             await db.execute("ALTER TABLE tool_calls ADD COLUMN scope TEXT")
+
+    # v5: pending attachments remember Telegram album/media-group identity.
+    if version < 5:
+        if not await _column_exists(db, "pending_attachments", "media_group_id"):
+            await db.execute("ALTER TABLE pending_attachments ADD COLUMN media_group_id TEXT")
 
     if version < DB_USER_VERSION:
         await db.execute(f"PRAGMA user_version = {DB_USER_VERSION}")
@@ -208,6 +214,7 @@ class PendingAttachment:
     chat_id: int
     file_id: str
     file_unique_id: str | None
+    media_group_id: str | None
     kind: str
     file_name: str | None
     mime_type: str | None
@@ -427,6 +434,7 @@ class SessionStore:
         chat_id: int,
         file_id: str,
         file_unique_id: str | None,
+        media_group_id: str | None,
         kind: str,
         file_name: str | None,
         mime_type: str | None,
@@ -438,14 +446,15 @@ class SessionStore:
         async with db.execute(
             """
             INSERT INTO pending_attachments
-                (chat_id, file_id, file_unique_id, kind, file_name,
+                (chat_id, file_id, file_unique_id, media_group_id, kind, file_name,
                  mime_type, file_size, caption, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 chat_id,
                 file_id,
                 file_unique_id,
+                media_group_id,
                 kind,
                 file_name,
                 mime_type,
@@ -462,7 +471,7 @@ class SessionStore:
         db = self._conn
         async with db.execute(
             """
-            SELECT id, chat_id, file_id, file_unique_id, kind, file_name,
+            SELECT id, chat_id, file_id, file_unique_id, media_group_id, kind, file_name,
                    mime_type, file_size, caption
             FROM pending_attachments
             WHERE chat_id = ?
@@ -475,6 +484,48 @@ class SessionStore:
         if row is None:
             return None
         return PendingAttachment(*row)
+
+    async def list_pending_attachments(
+        self,
+        chat_id: int,
+        *,
+        pending_ids: list[int] | None = None,
+        media_group_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[PendingAttachment]:
+        """Return pending attachments for a chat in arrival order.
+
+        Optional filters keep album/caption-driven tool calls scoped to the
+        attachments from the triggering Telegram update rather than old pending
+        files in the same chat.
+        """
+        db = self._conn
+        clauses = ["chat_id = ?"]
+        params: list[Any] = [chat_id]
+        if pending_ids:
+            placeholders = ", ".join("?" for _ in pending_ids)
+            clauses.append(f"id IN ({placeholders})")
+            params.extend(int(pid) for pid in pending_ids)
+        if media_group_id:
+            clauses.append("media_group_id = ?")
+            params.append(media_group_id)
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = " LIMIT ?"
+            params.append(max(1, int(limit)))
+        async with db.execute(
+            f"""
+            SELECT id, chat_id, file_id, file_unique_id, media_group_id, kind, file_name,
+                   mime_type, file_size, caption
+            FROM pending_attachments
+            WHERE {" AND ".join(clauses)}
+            ORDER BY created_at ASC, id ASC
+            {limit_sql}
+            """,
+            tuple(params),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [PendingAttachment(*row) for row in rows]
 
     async def delete_pending_attachment(self, pending_id: int) -> None:
         db = self._conn

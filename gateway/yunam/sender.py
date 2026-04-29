@@ -17,6 +17,7 @@ logger = logging.getLogger("yunam.sender")
 class AttachmentSender(Protocol):
     """Narrow channel for file I/O with Telegram."""
 
+    async def download_bytes(self, file_id: str) -> bytes: ...
     async def download_to(self, file_id: str, dest: Path) -> int: ...
     async def send_document(
         self, chat_id: int, path: Path, caption: str | None = None
@@ -31,6 +32,11 @@ class PTBSender:
 
     def __init__(self, bot):
         self._bot = bot
+
+    async def download_bytes(self, file_id: str) -> bytes:
+        """Fetch a Telegram file by file_id and return its bytes."""
+        tg_file = await self._bot.get_file(file_id)
+        return bytes(await tg_file.download_as_bytearray())
 
     async def download_to(self, file_id: str, dest: Path) -> int:
         """Fetch a Telegram file by file_id and write it to `dest`. Returns byte count."""

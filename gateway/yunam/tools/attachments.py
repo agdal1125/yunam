@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..embeddings import EmbeddingError, VoyageEmbedder
@@ -30,7 +31,8 @@ from ..files import (
     unique_target,
 )
 from ..sender import AttachmentSender
-from ..sessions import SavedFile, SessionStore
+from ..sessions import PendingAttachment, SavedFile, SessionStore
+from ..vision import extract_text_block, image_content_block, is_inline_image
 from .vault import VaultError, write_text_atomic as vault_write_text_atomic
 
 logger = logging.getLogger("yunam.tools.attachments")
@@ -39,6 +41,8 @@ logger = logging.getLogger("yunam.tools.attachments")
 # Search result caps.
 _MAX_SEARCH_LIMIT = 20
 _DEFAULT_SEARCH_LIMIT = 5
+_MAX_VISION_IMAGES = 10
+_DEFAULT_VISION_MODEL = "claude-sonnet-4-6"
 
 
 class AttachmentTools:
@@ -52,6 +56,8 @@ class AttachmentTools:
         obsidian_root: Path,
         sender: AttachmentSender,
         embedder: VoyageEmbedder,
+        vision_client: Any | None = None,
+        vision_model: str = _DEFAULT_VISION_MODEL,
         timezone: str = "Asia/Seoul",
     ):
         self._store = store
@@ -59,6 +65,8 @@ class AttachmentTools:
         self._obsidian = obsidian_root
         self._sender = sender
         self._embedder = embedder
+        self._vision_client = vision_client
+        self._vision_model = vision_model
         self._tz = ZoneInfo(timezone)
 
     # ---- public tool surface ---------------------------------------------
@@ -84,6 +92,32 @@ class AttachmentTools:
             f"({saved.file_size or 0} bytes, {saved.mime_type or 'unknown mime'}). "
             f"indexed for semantic search."
         )
+
+    async def save_attachments(
+        self,
+        *,
+        chat_id: int,
+        pending_ids: list[int] | None = None,
+        media_group_id: str | None = None,
+        caption: str | None = None,
+        description: str | None = None,
+    ) -> str:
+        saved = await self.commit_pending_attachments(
+            chat_id=chat_id,
+            pending_ids=pending_ids,
+            media_group_id=media_group_id,
+            caption_override=caption,
+            description=description,
+        )
+        if not saved:
+            return "no matching pending attachments for this chat; ask the user to resend."
+        lines = [f"saved {len(saved)} attachment(s):"]
+        for idx, sf in enumerate(saved, start=1):
+            lines.append(
+                f"{idx}. {sf.relpath} "
+                f"({sf.file_size or 0} bytes, {sf.mime_type or 'unknown mime'})"
+            )
+        return "\n".join(lines)
 
     async def search_files(
         self, *, chat_id: int, query: str, limit: int | None = None
@@ -126,6 +160,98 @@ class AttachmentTools:
             return f"retrieve error: send failed: {e}"
         return f"sent {path}"
 
+    async def extract_attachment_text(
+        self,
+        *,
+        chat_id: int,
+        pending_ids: list[int] | None = None,
+        media_group_id: str | None = None,
+        paths: list[str] | None = None,
+        prompt: str | None = None,
+    ) -> str:
+        """Use Claude vision to transcribe text from pending or saved images."""
+        if self._vision_client is None:
+            return "image text extraction unavailable: vision client is not configured."
+
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Extract all visible text from each image. Preserve line breaks "
+                    "where useful. Separate the result by image label. "
+                    f"User request: {prompt.strip() if prompt else 'extract text'}"
+                ),
+            }
+        ]
+        labels: list[str] = []
+        skipped: list[str] = []
+
+        pending: list[PendingAttachment] = []
+        if pending_ids or media_group_id or not paths:
+            pending = await self._store.list_pending_attachments(
+                chat_id,
+                pending_ids=_clean_pending_ids(pending_ids),
+                media_group_id=media_group_id,
+                limit=_MAX_VISION_IMAGES if not paths else None,
+            )
+        for item in pending[:_MAX_VISION_IMAGES]:
+            label = _pending_label(item)
+            if not is_inline_image(item.kind, item.mime_type):
+                skipped.append(
+                    f"{label}: not an image ({item.kind}/{item.mime_type or 'unknown'})"
+                )
+                continue
+            try:
+                data = await self._sender.download_bytes(item.file_id)
+                content.append({"type": "text", "text": label})
+                content.append(image_content_block(data, item.mime_type))
+                labels.append(label)
+            except Exception as e:
+                logger.exception("pending image download failed id=%s", item.id)
+                skipped.append(f"{label}: download failed ({e})")
+
+        remaining = max(0, _MAX_VISION_IMAGES - len(labels))
+        for relpath in (paths or [])[:remaining]:
+            label = f"saved file {relpath}"
+            try:
+                target = filevault_safe_join(self._filevault, relpath)
+            except FilevaultError as e:
+                skipped.append(f"{label}: {e}")
+                continue
+            if not target.is_file():
+                skipped.append(f"{label}: not found")
+                continue
+            mime_type = _mime_from_suffix(target.suffix)
+            if not is_inline_image("document", mime_type):
+                skipped.append(f"{label}: unsupported image type ({target.suffix})")
+                continue
+            try:
+                content.append({"type": "text", "text": label})
+                content.append(image_content_block(target.read_bytes(), mime_type))
+                labels.append(label)
+            except Exception as e:
+                logger.exception("saved image read failed path=%s", target)
+                skipped.append(f"{label}: read failed ({e})")
+
+        if not labels:
+            suffix = f" Skipped: {'; '.join(skipped)}" if skipped else ""
+            return f"no supported images found for text extraction.{suffix}"
+
+        try:
+            response = await self._vision_client.messages.create(
+                model=self._vision_model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": content}],
+            )
+        except Exception as e:
+            logger.exception("vision extraction failed")
+            return f"image text extraction failed: {e}"
+
+        result = extract_text_block(response.content)
+        if skipped:
+            result = f"{result}\n\nSkipped: {'; '.join(skipped)}"
+        return result
+
     # ---- shared save path (used by agent tool AND /save command) ---------
 
     async def commit_pending(
@@ -140,6 +266,51 @@ class AttachmentTools:
         pending = await self._store.latest_pending_attachment(chat_id)
         if pending is None:
             return None
+        return await self._commit_one_pending(
+            chat_id=chat_id,
+            pending=pending,
+            destination_name=destination_name,
+            caption_override=caption_override,
+            description=description,
+        )
+
+    async def commit_pending_attachments(
+        self,
+        *,
+        chat_id: int,
+        pending_ids: list[int] | None = None,
+        media_group_id: str | None = None,
+        caption_override: str | None = None,
+        description: str | None = None,
+    ) -> list[SavedFile]:
+        """Save multiple pending attachments, preserving Telegram arrival order."""
+        pending = await self._store.list_pending_attachments(
+            chat_id,
+            pending_ids=_clean_pending_ids(pending_ids),
+            media_group_id=media_group_id,
+        )
+        saved: list[SavedFile] = []
+        for item in pending:
+            saved.append(
+                await self._commit_one_pending(
+                    chat_id=chat_id,
+                    pending=item,
+                    caption_override=caption_override,
+                    description=description,
+                )
+            )
+        return saved
+
+    async def _commit_one_pending(
+        self,
+        *,
+        chat_id: int,
+        pending: PendingAttachment,
+        destination_name: str | None = None,
+        caption_override: str | None = None,
+        description: str | None = None,
+    ) -> SavedFile:
+        """Save a specific pending attachment to the filevault."""
 
         today = datetime.now(self._tz).strftime("%Y-%m-%d")
         ext = extension_for(pending.kind, pending.mime_type, pending.file_name)
@@ -266,6 +437,33 @@ class AttachmentTools:
             # Breadcrumb failure shouldn't block the core save — the file and
             # embedding are already committed. Log and move on.
             logger.warning("breadcrumb write failed for %s: %s", note_relpath, e)
+
+def _clean_pending_ids(value: list[int] | None) -> list[int] | None:
+    if not value:
+        return None
+    cleaned: list[int] = []
+    for item in value:
+        try:
+            cleaned.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return cleaned or None
+
+
+def _pending_label(item: PendingAttachment) -> str:
+    name = item.file_name or item.kind
+    return f"pending image {item.id} ({name})"
+
+
+def _mime_from_suffix(suffix: str) -> str | None:
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(suffix.lower())
+
 
 def _yaml_scalar(value: str) -> str:
     """Quote a YAML scalar that might contain colons/quotes/newlines."""

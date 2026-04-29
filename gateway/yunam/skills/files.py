@@ -15,7 +15,7 @@ from .base import DispatchContext, Skill, ToolSpec
 
 
 SKILL_ID = "files"
-SKILL_VERSION = "1"
+SKILL_VERSION = "2"
 
 
 SYSTEM_PROMPT_FRAGMENT = """\
@@ -45,6 +45,15 @@ Each saved file also gets a Markdown breadcrumb in the Obsidian vault at
 `files/YYYY-MM-DD/<filename>.md` with frontmatter metadata. This means
 `vault_search` will also find references to attachments — useful when the user
 mixes text and file-based recall.
+
+For albums or plural requests like "save these images/files", use
+`save_attachments`, not repeated `save_attachment` calls. If the current user
+message lists pending attachment ids or a media_group_id, pass those values so
+old pending files are not accidentally saved.
+
+For requests to OCR, transcribe, read, or extract prompts/text from images, use
+`extract_attachment_text`. Do not ask for `/save` first; pending Telegram images
+can be read directly.
 
 Don't save files the user hasn't explicitly asked you to save. If an attachment
 is pending and the user's intent is unclear, ask.
@@ -88,6 +97,77 @@ _SCHEMAS: dict[str, dict[str, Any]] = {
                         "gave about the file — what it's for, when it was taken, "
                         "why it matters. Improves semantic retrieval."
                     ),
+                },
+            },
+            "required": [],
+        },
+    },
+    "save_attachments": {
+        "name": "save_attachments",
+        "description": (
+            "Commit multiple pending attachments to the filevault. Use this for "
+            "Telegram albums or plural requests like 'save these images/files'. "
+            "When the user message lists pending_ids or media_group_id, pass them "
+            "to keep the operation scoped to the current upload."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pending_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Pending attachment ids from the current user message. "
+                        "Optional, but preferred when provided."
+                    ),
+                },
+                "media_group_id": {
+                    "type": "string",
+                    "description": "Telegram media_group_id for the current album.",
+                },
+                "caption": {
+                    "type": "string",
+                    "description": "Optional short caption to store on every saved file.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional context/notes to store on every saved file.",
+                },
+            },
+            "required": [],
+        },
+    },
+    "extract_attachment_text": {
+        "name": "extract_attachment_text",
+        "description": (
+            "Extract visible text from pending or saved image attachments using "
+            "vision. Use when the user asks to OCR, read, transcribe, or extract "
+            "text/prompts from images. Pending Telegram images do not need to be "
+            "saved first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pending_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": (
+                        "Pending image ids from the current upload. Optional, "
+                        "but preferred when the user message lists them."
+                    ),
+                },
+                "media_group_id": {
+                    "type": "string",
+                    "description": "Telegram media_group_id for the current album.",
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Saved filevault-relative image paths to read.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The user's OCR/extraction instruction.",
                 },
             },
             "required": [],
@@ -162,6 +242,12 @@ def build_files_skill(tools: AttachmentTools) -> Skill:
     async def _save(inputs: dict[str, Any], ctx: DispatchContext) -> str:
         return await tools.save_attachment(chat_id=ctx.chat_id, **inputs)
 
+    async def _save_many(inputs: dict[str, Any], ctx: DispatchContext) -> str:
+        return await tools.save_attachments(chat_id=ctx.chat_id, **inputs)
+
+    async def _extract_text(inputs: dict[str, Any], ctx: DispatchContext) -> str:
+        return await tools.extract_attachment_text(chat_id=ctx.chat_id, **inputs)
+
     async def _search(inputs: dict[str, Any], ctx: DispatchContext) -> str:
         return await tools.search_files(chat_id=ctx.chat_id, **inputs)
 
@@ -170,6 +256,13 @@ def build_files_skill(tools: AttachmentTools) -> Skill:
 
     specs: tuple[ToolSpec, ...] = (
         ToolSpec("save_attachment", Scope.FILEVAULT_WRITE, _SCHEMAS["save_attachment"], _save),
+        ToolSpec("save_attachments", Scope.FILEVAULT_WRITE, _SCHEMAS["save_attachments"], _save_many),
+        ToolSpec(
+            "extract_attachment_text",
+            Scope.FILEVAULT_READ,
+            _SCHEMAS["extract_attachment_text"],
+            _extract_text,
+        ),
         ToolSpec("search_files", Scope.FILEVAULT_READ, _SCHEMAS["search_files"], _search),
         ToolSpec(
             "retrieve_attachment",
