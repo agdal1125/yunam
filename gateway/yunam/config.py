@@ -47,6 +47,7 @@ class Config:
     jina_api_key: str | None
     sweettracker_api_key: str | None
     gcal_mcp_url: str | None
+    stock_mcp_url: str | None
 
     @property
     def principals_by_id(self) -> dict[int, Principal]:
@@ -200,6 +201,7 @@ def load_config() -> Config:
     jina_api_key_raw = os.environ.get("JINA_API_KEY", "").strip()
     sweettracker_api_key_raw = os.environ.get("SWEETTRACKER_API_KEY", "").strip()
     gcal_mcp_url_raw = os.environ.get("YUNAM_GCAL_MCP_URL", "").strip()
+    stock_mcp_url_raw = os.environ.get("YUNAM_STOCK_MCP_URL", "").strip()
 
     return Config(
         telegram_token=os.environ["TELEGRAM_BOT_TOKEN"],
@@ -219,6 +221,7 @@ def load_config() -> Config:
         jina_api_key=jina_api_key_raw or None,
         sweettracker_api_key=sweettracker_api_key_raw or None,
         gcal_mcp_url=gcal_mcp_url_raw or None,
+        stock_mcp_url=stock_mcp_url_raw or None,
     )
 
 

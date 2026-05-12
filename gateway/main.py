@@ -37,6 +37,7 @@ from yunam.scheduler import (
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
 from yunam.mcp import GCalMCPClient, build_gcal_mcp_skill
+from yunam.mcp.stock import StockMCPClient, StockSkill
 from yunam.skills import (
     Skill,
     SkillRegistry,
@@ -121,6 +122,16 @@ async def _run() -> None:
     else:
         logger.info("YUNAM_GCAL_MCP_URL unset — gcal skill disabled")
 
+    stock_client: StockMCPClient | None = None
+    stock_skill: Skill | None = None
+    if cfg.stock_mcp_url:
+        logger.info("stock MCP configured at %s — connecting", cfg.stock_mcp_url)
+        stock_client = StockMCPClient(cfg.stock_mcp_url)
+        await stock_client.connect()
+        stock_skill = StockSkill(stock_client)
+    else:
+        logger.info("YUNAM_STOCK_MCP_URL unset — stock skill disabled")
+
     # Skill order is a prompt-cache-affecting invariant — the flattened tool
     # list Claude sees is [obsidian, files, web, airquality, parcel, gcal?,
     # reminders, memory, obsidian_graph], and the concatenated system prompt
@@ -134,6 +145,8 @@ async def _run() -> None:
     ]
     if gcal_skill is not None:
         skills.append(gcal_skill)
+    if stock_skill is not None:
+        skills.append(stock_skill)
     skills.append(build_reminders_skill(reminder_tools))
     skills.append(build_memory_skill(memory_tools))
     skills.append(build_obsidian_graph_skill(graph_tools))
@@ -257,6 +270,8 @@ async def _run() -> None:
             logger.exception("error during shutdown")
         if gcal_client is not None:
             await gcal_client.close()
+        if stock_client is not None:
+            await stock_client.close()
         await store.close()
         logger.info("gateway stopped cleanly")
 

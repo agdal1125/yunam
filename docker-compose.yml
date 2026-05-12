@@ -23,6 +23,36 @@ services:
       calendar-mcp:
         condition: service_healthy
         required: false  # gcal is optional — gateway starts even if MCP is disabled
+      stock-mcp:
+        condition: service_started
+        required: false
+
+  # Stock Agent MCP server (Local API wrapper for supply/demand data)
+  stock-mcp:
+    build: ../stock-agent
+    container_name: yunam-stock-mcp
+    restart: unless-stopped
+    command: ["python", "-m", "stock_agent.agent_int.mcp_run"]
+    environment:
+      - KRX_ID=${KRX_ID}
+      - KRX_PW=${KRX_PW}
+    volumes:
+      - ../stock-agent/data:/app/data
+      - ../stock-agent/wiki:/app/wiki
+    # Override Dockerfile healthcheck (which probes port 8001 for the FastAPI app)
+    # since mcp_run.py serves SSE on port 3001 instead.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as r; r.urlopen('http://127.0.0.1:3001/sse', timeout=3)\" || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 256M
 
   # Google Calendar MCP server (nspady/google-calendar-mcp).
   #
