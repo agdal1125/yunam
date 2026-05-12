@@ -16,6 +16,7 @@ import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+from ..config import Principal
 from ..embeddings import VoyageEmbedder
 from ..sessions import SessionStore
 from ..tools.vault import VaultError
@@ -40,12 +41,30 @@ MAX_DISTANCE = 0.85
 
 
 class MemoryTools:
-    def __init__(self, store: SessionStore, embedder: VoyageEmbedder, timezone_name: str):
+    def __init__(
+        self,
+        store: SessionStore,
+        embedder: VoyageEmbedder,
+        timezone_name: str,
+        principals: tuple[Principal, ...] = (),
+    ):
         self._store = store
         self._embedder = embedder
         self._tz = ZoneInfo(timezone_name)
+        # Used only for rendering speaker names in recall output. Empty tuple
+        # is fine — falls back to `user-<id>` labels.
+        self._principals_by_id: dict[int, Principal] = {
+            p.user_id: p for p in principals
+        }
 
-    async def recall(self, chat_id: int, query: str, limit: int = DEFAULT_LIMIT) -> str:
+    async def recall(
+        self,
+        chat_id: int,
+        query: str,
+        limit: int = DEFAULT_LIMIT,
+        *,
+        viewer_user_id: int | None = None,
+    ) -> str:
         if not isinstance(query, str) or not query.strip():
             raise VaultError("query must be a non-empty string")
         if not isinstance(limit, int):
@@ -57,6 +76,7 @@ class MemoryTools:
             chat_id=chat_id,
             query_embedding=query_vec,
             limit=limit,
+            viewer_user_id=viewer_user_id,
         )
         # Drop matches that are too far to be meaningful.
         turns = [t for t in turns if t.distance <= MAX_DISTANCE]
@@ -68,12 +88,22 @@ class MemoryTools:
             when = self._format_local(t.created_at)
             user = _truncate(t.user_text, MAX_RECALL_BYTES_PER_SIDE)
             asst = _truncate(t.assistant_text, MAX_RECALL_BYTES_PER_SIDE)
+            speaker_label = self._speaker_label(t.user_id)
             blocks.append(
                 f"[{when}, distance {t.distance:.2f}]\n"
-                f"jaekeun: {user}\n"
+                f"{speaker_label}: {user}\n"
                 f"yunam: {asst}"
             )
         return "\n\n---\n\n".join(blocks)
+
+    def _speaker_label(self, user_id: int | None) -> str:
+        """Render a recalled turn's speaker as a name. NULL = legacy / pre-v6
+        rows where we never recorded the speaker — assume jaekeun for
+        backward compat (only deployment that has them)."""
+        if user_id is None:
+            return "jaekeun"
+        principal = self._principals_by_id.get(int(user_id))
+        return principal.name if principal else f"user-{int(user_id)}"
 
     def _format_local(self, iso_utc: str) -> str:
         try:

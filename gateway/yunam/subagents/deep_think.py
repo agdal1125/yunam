@@ -16,6 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..config import Principal
 from ..orchestrator import Orchestrator
 from ..sessions import SessionStore
 from ..skills.base import SkillRegistry
@@ -34,6 +35,7 @@ def build_deep_think_orchestrator(
     *,
     vault_path: Path | None = None,
     embedder: Any | None = None,
+    principals: tuple[Principal, ...] = (),
 ) -> Orchestrator:
     """Build a deep-think Orchestrator (Opus 4.7 + adaptive thinking / high effort).
 
@@ -52,4 +54,5 @@ def build_deep_think_orchestrator(
         max_tokens=DEEP_THINK_MAX_TOKENS,
         thinking={"type": "adaptive"},
         output_config={"effort": "high"},
+        principals=principals,
     )

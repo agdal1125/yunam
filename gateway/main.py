@@ -7,6 +7,10 @@ and logged at WARNING.
 Uses the manual PTB lifecycle (initialize/start/start_polling/stop/shutdown)
 rather than `app.run_polling()` so aiosqlite opens/closes in the same asyncio
 event loop.
+
+Handler definitions live in `handlers/`; this module is purely the composition
+root — it builds dependencies, stuffs them into `bot_data`, registers handlers
+via `handlers.register_handlers()`, and manages the application lifecycle.
 """
 
 from __future__ import annotations
@@ -14,29 +18,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
-from dataclasses import dataclass, field
-from typing import Any
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.constants import ChatAction
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from telegram.ext import Application
 
 import anthropic
 
-from yunam.config import Config, configure_logging, load_config
+from handlers import register_handlers
+from handlers._helpers import TELEGRAM_MSG_LIMIT
+from yunam.config import configure_logging, load_config
 from yunam.embeddings import VoyageEmbedder
 from yunam.orchestrator import Orchestrator
-from yunam.prompts import DAILY_PROMPT_TEMPLATE
 from yunam.scheduler import (
     now_utc_iso,
-    run_daily_scheduler,
     run_nudge_sweeper,
 )
 from yunam.sender import PTBSender
@@ -51,6 +46,7 @@ from yunam.skills import (
     build_obsidian_graph_skill,
     build_obsidian_skill,
     build_parcel_skill,
+    build_privacy_skill,
     build_reminders_skill,
     build_web_skill,
 )
@@ -63,602 +59,21 @@ from yunam.tools.obsidian_graph import ObsidianGraphTools
 from yunam.tools.parcel import ParcelTools
 from yunam.tools.reminders import ReminderTools
 from yunam.tools.web import WebTools
-from yunam.vision import image_content_block, is_inline_image
 
 load_dotenv()
 configure_logging()
 logger = logging.getLogger("yunam.gateway")
 
-TELEGRAM_MSG_LIMIT = 4096
-MEDIA_GROUP_SETTLE_SECONDS = 1.25
-MAX_INLINE_ATTACHMENT_IMAGES = 10
-
-
-@dataclass
-class AttachmentBatch:
-    chat_id: int
-    media_group_id: str | None
-    pending_ids: list[int] = field(default_factory=list)
-    items: list[dict[str, Any]] = field(default_factory=list)
-    caption: str | None = None
-    reply_to_message_id: int | None = None
-    task: asyncio.Task[None] | None = None
-
-
-def _is_authorized(update: Update, allowed_user_id: int) -> bool:
-    user = update.effective_user
-    if user is None:
-        logger.warning("update with no effective_user: %s", update.update_id)
-        return False
-    if user.id != allowed_user_id:
-        logger.warning(
-            "unauthorized access: user_id=%s username=%s",
-            user.id,
-            user.username,
-        )
-        return False
-    return True
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = context.application.bot_data["cfg"]
-    if not _is_authorized(update, cfg.allowed_user_id):
-        return
-    logger.info("/start from user_id=%s", update.effective_user.id)
-    await update.message.reply_text(
-        "Yunam online. I have access to your Obsidian vault — ask me anything."
-    )
-
-
-def _extract_attachment(message) -> dict | None:
-    """Return a kind/file_id/metadata dict for the attachment on `message`, or None.
-
-    Photos are delivered as an array of sizes; we use the largest. Everything
-    else has a single nested object. Order reflects Telegram's priorities.
-    """
-    if message.photo:
-        largest = message.photo[-1]
-        return {
-            "kind": "photo",
-            "file_id": largest.file_id,
-            "file_unique_id": largest.file_unique_id,
-            "file_name": None,
-            "mime_type": "image/jpeg",
-            "file_size": largest.file_size,
-        }
-    if message.document:
-        d = message.document
-        return {
-            "kind": "document",
-            "file_id": d.file_id,
-            "file_unique_id": d.file_unique_id,
-            "file_name": d.file_name,
-            "mime_type": d.mime_type,
-            "file_size": d.file_size,
-        }
-    if message.video:
-        v = message.video
-        return {
-            "kind": "video",
-            "file_id": v.file_id,
-            "file_unique_id": v.file_unique_id,
-            "file_name": v.file_name,
-            "mime_type": v.mime_type,
-            "file_size": v.file_size,
-        }
-    if message.animation:
-        a = message.animation
-        return {
-            "kind": "animation",
-            "file_id": a.file_id,
-            "file_unique_id": a.file_unique_id,
-            "file_name": a.file_name,
-            "mime_type": a.mime_type,
-            "file_size": a.file_size,
-        }
-    if message.voice:
-        v = message.voice
-        return {
-            "kind": "voice",
-            "file_id": v.file_id,
-            "file_unique_id": v.file_unique_id,
-            "file_name": None,
-            "mime_type": v.mime_type or "audio/ogg",
-            "file_size": v.file_size,
-        }
-    if message.audio:
-        a = message.audio
-        return {
-            "kind": "audio",
-            "file_id": a.file_id,
-            "file_unique_id": a.file_unique_id,
-            "file_name": a.file_name,
-            "mime_type": a.mime_type,
-            "file_size": a.file_size,
-        }
-    return None
-
-
-async def on_attachment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Record an incoming attachment. Saves immediately if caption starts with /save."""
-    cfg: Config = context.application.bot_data["cfg"]
-    if not _is_authorized(update, cfg.allowed_user_id):
-        return
-
-    message = update.message
-    if message is None:
-        return
-    meta = _extract_attachment(message)
-    if meta is None:
-        return
-
-    chat_id = update.effective_chat.id
-    caption = message.caption
-    media_group_id = getattr(message, "media_group_id", None)
-    store: SessionStore = context.application.bot_data["store"]
-
-    # Always stash in `pending_attachments` — cheap, defers download until /save.
-    pending_id = await store.add_pending_attachment(
-        chat_id=chat_id,
-        file_id=meta["file_id"],
-        file_unique_id=meta["file_unique_id"],
-        media_group_id=media_group_id,
-        kind=meta["kind"],
-        file_name=meta["file_name"],
-        mime_type=meta["mime_type"],
-        file_size=meta["file_size"],
-        caption=caption,
-    )
-    logger.info(
-        "attachment received chat_id=%s kind=%s file_id=%s name=%s size=%s pending_id=%s media_group_id=%s",
-        chat_id,
-        meta["kind"],
-        meta["file_id"][:16] + "...",
-        meta["file_name"],
-        meta["file_size"],
-        pending_id,
-        media_group_id,
-    )
-
-    # Captions are instructions. Route them once per attachment or media group.
-    item = {
-        **meta,
-        "pending_id": pending_id,
-        "caption": caption,
-        "media_group_id": media_group_id,
-    }
-    if media_group_id:
-        _queue_media_group_item(
-            context,
-            chat_id=chat_id,
-            media_group_id=media_group_id,
-            item=item,
-            caption=caption,
-            reply_to_message_id=message.message_id,
-        )
-        return
-
-    await _process_attachment_batch(
-        context.application.bot,
-        context.application.bot_data,
-        chat_id=chat_id,
-        pending_ids=[pending_id],
-        items=[item],
-        caption=caption,
-        media_group_id=None,
-        reply_to_message_id=message.message_id,
-    )
-    return
-
-
-def _strip_save_prefix(caption: str | None) -> str | None:
-    """Return the caption with the leading `/save` command stripped, or None if empty."""
-    if caption is None:
-        return None
-    stripped = caption.strip()
-    if not stripped.lower().startswith("/save"):
-        return caption
-    remainder = stripped[len("/save"):].lstrip()
-    return remainder or None
-
-
-def _queue_media_group_item(
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    chat_id: int,
-    media_group_id: str,
-    item: dict[str, Any],
-    caption: str | None,
-    reply_to_message_id: int,
-) -> None:
-    batches: dict[str, AttachmentBatch] = context.application.bot_data.setdefault(
-        "media_group_batches", {}
-    )
-    key = f"{chat_id}:{media_group_id}"
-    batch = batches.get(key)
-    if batch is None:
-        batch = AttachmentBatch(chat_id=chat_id, media_group_id=media_group_id)
-        batches[key] = batch
-    batch.pending_ids.append(int(item["pending_id"]))
-    batch.items.append(item)
-    if caption and caption.strip():
-        batch.caption = caption
-        batch.reply_to_message_id = reply_to_message_id
-    elif batch.reply_to_message_id is None:
-        batch.reply_to_message_id = reply_to_message_id
-
-    if batch.task is not None and not batch.task.done():
-        batch.task.cancel()
-    batch.task = asyncio.create_task(
-        _flush_media_group_batch(context.application, key),
-        name=f"yunam-media-group-{key}",
-    )
-
-
-async def _flush_media_group_batch(application, key: str) -> None:
-    try:
-        await asyncio.sleep(MEDIA_GROUP_SETTLE_SECONDS)
-    except asyncio.CancelledError:
-        return
-    batches: dict[str, AttachmentBatch] = application.bot_data.setdefault(
-        "media_group_batches", {}
-    )
-    batch = batches.pop(key, None)
-    if batch is None:
-        return
-    try:
-        await _process_attachment_batch(
-            application.bot,
-            application.bot_data,
-            chat_id=batch.chat_id,
-            pending_ids=batch.pending_ids,
-            items=batch.items,
-            caption=batch.caption,
-            media_group_id=batch.media_group_id,
-            reply_to_message_id=batch.reply_to_message_id,
-        )
-    except Exception:
-        logger.exception("media group batch processing failed key=%s", key)
-
-
-async def _process_attachment_batch(
-    bot,
-    bot_data: dict[str, Any],
-    *,
-    chat_id: int,
-    pending_ids: list[int],
-    items: list[dict[str, Any]],
-    caption: str | None,
-    media_group_id: str | None,
-    reply_to_message_id: int | None,
-) -> None:
-    instruction = (caption or "").strip()
-    if instruction.lower().startswith("/save"):
-        await _commit_pending_ids_and_send(
-            bot,
-            bot_data,
-            chat_id=chat_id,
-            pending_ids=pending_ids,
-            media_group_id=media_group_id,
-            caption_override=_strip_save_prefix(instruction),
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    if not instruction:
-        await _send_reply(
-            bot,
-            chat_id,
-            "받았어. 저장하려면 /save를 보내거나, 무엇을 할지 말해줘.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-
-    orch_key = "orch"
-    if instruction.lower().startswith("/think"):
-        orch_key = "deep_orch"
-        instruction = _strip_command_prefix(instruction, "/think")
-        if not instruction:
-            await _send_reply(
-                bot,
-                chat_id,
-                "Usage: /think <your question>",
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-
-    try:
-        await bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception:
-        logger.debug("send_chat_action failed", exc_info=True)
-
-    user_text = _build_attachment_user_text(
-        instruction,
-        pending_ids=pending_ids,
-        items=items,
-        media_group_id=media_group_id,
-    )
-    user_content = await _build_attachment_user_content(
-        bot,
-        instruction,
-        pending_ids=pending_ids,
-        items=items,
-        media_group_id=media_group_id,
-    )
-    orch: Orchestrator = bot_data[orch_key]
-    try:
-        response = await orch.handle_turn(
-            chat_id,
-            user_text,
-            user_content=user_content,
-        )
-    except Exception:
-        logger.exception("attachment orchestrator failure chat_id=%s", chat_id)
-        response = "처리 중 문제가 생겼어. 로그를 확인해줘."
-    await _send_reply(
-        bot,
-        chat_id,
-        response[:TELEGRAM_MSG_LIMIT],
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
-async def _commit_pending_ids_and_send(
-    bot,
-    bot_data: dict[str, Any],
-    *,
-    chat_id: int,
-    pending_ids: list[int],
-    media_group_id: str | None,
-    caption_override: str | None,
-    reply_to_message_id: int | None,
-) -> None:
-    attachments: AttachmentTools | None = bot_data.get("attachments")
-    if attachments is None:
-        await _send_reply(
-            bot,
-            chat_id,
-            "attachments not configured on this server.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-    try:
-        saved = await attachments.commit_pending_attachments(
-            chat_id=chat_id,
-            pending_ids=pending_ids,
-            media_group_id=media_group_id,
-            caption_override=caption_override,
-        )
-    except Exception:
-        logger.exception("commit_pending_attachments failed chat_id=%s", chat_id)
-        await _send_reply(
-            bot,
-            chat_id,
-            "저장에 실패했어. 로그를 확인해줘.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-    if not saved:
-        await _send_reply(
-            bot,
-            chat_id,
-            "저장할 최근 첨부를 찾지 못했어. 파일을 다시 보내줘.",
-            reply_to_message_id=reply_to_message_id,
-        )
-        return
-    paths = ", ".join(sf.relpath for sf in saved[:5])
-    more = f" 외 {len(saved) - 5}개" if len(saved) > 5 else ""
-    await _send_reply(
-        bot,
-        chat_id,
-        f"{len(saved)}개 저장했어: {paths}{more}",
-        reply_to_message_id=reply_to_message_id,
-    )
-
-
-def _build_attachment_user_text(
-    instruction: str,
-    *,
-    pending_ids: list[int],
-    items: list[dict[str, Any]],
-    media_group_id: str | None,
-) -> str:
-    lines = [
-        "The user sent Telegram attachment(s) with this instruction:",
-        instruction,
-        "",
-        f"Pending attachment ids for this turn: {', '.join(str(pid) for pid in pending_ids)}",
-    ]
-    if media_group_id:
-        lines.append(f"Telegram media_group_id for this turn: {media_group_id}")
-    lines.append("Attachment metadata:")
-    for idx, item in enumerate(items, start=1):
-        lines.append(
-            f"{idx}. pending_id={item['pending_id']} kind={item['kind']} "
-            f"mime={item.get('mime_type') or 'unknown'} "
-            f"name={item.get('file_name') or '(none)'}"
-        )
-    lines.append(
-        "When saving this upload, use save_attachments with the pending ids above. "
-        "When extracting text from images, inspect the attached image blocks or use "
-        "extract_attachment_text with the same pending ids."
-    )
-    return "\n".join(lines)
-
-
-async def _build_attachment_user_content(
-    bot,
-    instruction: str,
-    *,
-    pending_ids: list[int],
-    items: list[dict[str, Any]],
-    media_group_id: str | None,
-) -> list[dict[str, Any]]:
-    content: list[dict[str, Any]] = [
-        {
-            "type": "text",
-            "text": _build_attachment_user_text(
-                instruction,
-                pending_ids=pending_ids,
-                items=items,
-                media_group_id=media_group_id,
-            ),
-        }
-    ]
-    inline_count = 0
-    for idx, item in enumerate(items, start=1):
-        if inline_count >= MAX_INLINE_ATTACHMENT_IMAGES:
-            content.append(
-                {
-                    "type": "text",
-                    "text": "Additional images omitted from inline vision context; use extract_attachment_text for remaining pending ids.",
-                }
-            )
-            break
-        if not is_inline_image(item.get("kind"), item.get("mime_type")):
-            continue
-        label = (
-            f"Image {idx}: pending_id={item['pending_id']} "
-            f"kind={item['kind']} mime={item.get('mime_type') or 'unknown'}"
-        )
-        try:
-            tg_file = await bot.get_file(item["file_id"])
-            data = bytes(await tg_file.download_as_bytearray())
-            content.append({"type": "text", "text": label})
-            content.append(image_content_block(data, item.get("mime_type")))
-            inline_count += 1
-        except Exception:
-            logger.exception("inline image download failed pending_id=%s", item["pending_id"])
-            content.append({"type": "text", "text": f"{label}: inline download failed"})
-    return content
-
-
-def _strip_command_prefix(text: str, command: str) -> str:
-    stripped = text.strip()
-    if stripped.lower().startswith(command.lower()):
-        return stripped[len(command):].lstrip()
-    return stripped
-
-
-async def _send_reply(
-    bot,
-    chat_id: int,
-    text: str,
-    *,
-    reply_to_message_id: int | None = None,
-) -> None:
-    del reply_to_message_id  # Keep callers simple; plain chat replies are most compatible.
-    kwargs: dict[str, Any] = {"chat_id": chat_id, "text": text}
-    await bot.send_message(**kwargs)
-
-
-async def _commit_and_reply(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    *,
-    caption_override: str | None = None,
-) -> None:
-    chat_id = update.effective_chat.id
-    attachments: AttachmentTools | None = context.application.bot_data.get("attachments")
-    if attachments is None:
-        await update.message.reply_text("attachments not configured on this server.")
-        return
-    try:
-        saved = await attachments.commit_pending(
-            chat_id=chat_id, caption_override=caption_override
-        )
-    except Exception:
-        logger.exception("commit_pending failed chat_id=%s", chat_id)
-        await update.message.reply_text("save failed — check the logs.")
-        return
-    if saved is None:
-        await update.message.reply_text(
-            "no recent attachment to save. Send a file first, then /save."
-        )
-        return
-    await update.message.reply_text(
-        f"✅ saved: {saved.relpath} ({saved.file_size or 0} bytes). indexed."
-    )
-
-
-async def on_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle `/save` typed as its own message (no attachment in this message)."""
-    cfg: Config = context.application.bot_data["cfg"]
-    if not _is_authorized(update, cfg.allowed_user_id):
-        return
-    # If /save was attached to a file, `on_attachment` already handled it — this
-    # path is only for "/save" typed on its own or with text args.
-    text = (update.message.text or "").strip()
-    remainder = text[len("/save"):].lstrip() if text.lower().startswith("/save") else None
-    await _commit_and_reply(update, context, caption_override=remainder or None)
-
-
-async def on_think(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle `/think <query>` — route to the Opus deep-think orchestrator."""
-    cfg: Config = context.application.bot_data["cfg"]
-    if not _is_authorized(update, cfg.allowed_user_id):
-        return
-
-    text = (update.message.text or "").strip()
-    # `/think` with optional args — split on first whitespace.
-    parts = text.split(maxsplit=1)
-    query = parts[1].strip() if len(parts) > 1 else ""
-    if not query:
-        await update.message.reply_text(
-            "Usage: /think <your question>\n"
-            "Routes to Opus 4.7 with adaptive thinking. Costs more — use for "
-            "problems where Sonnet's default reply feels shallow."
-        )
-        return
-
-    chat_id = update.effective_chat.id
-    logger.info("/think start chat_id=%s len=%d", chat_id, len(query))
-
-    try:
-        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception:
-        logger.debug("send_chat_action failed", exc_info=True)
-
-    deep_orch: Orchestrator = context.application.bot_data["deep_orch"]
-    try:
-        response = await deep_orch.handle_turn(chat_id, query)
-    except Exception:
-        logger.exception("/think orchestrator failure chat_id=%s", chat_id)
-        response = "Sorry — deep-think failed. Check the logs."
-
-    await update.message.reply_text(response[:TELEGRAM_MSG_LIMIT])
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg: Config = context.application.bot_data["cfg"]
-    if not _is_authorized(update, cfg.allowed_user_id):
-        return
-
-    chat_id = update.effective_chat.id
-    user_text = update.message.text or ""
-    logger.info("turn start chat_id=%s len=%d", chat_id, len(user_text))
-
-    try:
-        await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
-    except Exception:
-        # A typing indicator failure should not abort the turn.
-        logger.debug("send_chat_action failed", exc_info=True)
-
-    orch: Orchestrator = context.application.bot_data["orch"]
-    try:
-        response = await orch.handle_turn(chat_id, user_text)
-    except Exception:
-        logger.exception("orchestrator failure chat_id=%s", chat_id)
-        response = "Sorry — something went wrong on my end. Check the logs."
-
-    await update.message.reply_text(response[:TELEGRAM_MSG_LIMIT])
-
 
 async def _run() -> None:
     cfg = load_config()
     logger.info(
-        "gateway starting; allowlist user_id=%s vault=%s filevault=%s db=%s",
-        cfg.allowed_user_id,
+        "gateway starting; principals=%s owner=%s allowed_chats=%s "
+        "group_triggers=%s vault=%s filevault=%s db=%s",
+        ", ".join(f"{p.name}({p.user_id})" for p in cfg.principals),
+        cfg.owner.name,
+        list(cfg.allowed_chats) if cfg.allowed_chats else "(DM-only)",
+        list(cfg.group_triggers) if cfg.group_triggers else "(@mention-only)",
         cfg.vault_path,
         cfg.filevault_path,
         cfg.db_path,
@@ -684,7 +99,12 @@ async def _run() -> None:
     airquality_tools = AirQualityTools()
     parcel_tools = ParcelTools(api_key=cfg.sweettracker_api_key)
     reminder_tools = ReminderTools(store=store, timezone_name=cfg.timezone)
-    memory_tools = MemoryTools(store=store, embedder=embedder, timezone_name=cfg.timezone)
+    memory_tools = MemoryTools(
+        store=store,
+        embedder=embedder,
+        timezone_name=cfg.timezone,
+        principals=cfg.principals,
+    )
     graph_tools = ObsidianGraphTools(vault_root=cfg.vault_path)
 
     # Optional: connect to the Google Calendar MCP sibling container. If the
@@ -717,12 +137,17 @@ async def _run() -> None:
     skills.append(build_reminders_skill(reminder_tools))
     skills.append(build_memory_skill(memory_tools))
     skills.append(build_obsidian_graph_skill(graph_tools))
+    # Privacy skill is appended last — adding it doesn't reorder any existing
+    # skill (preserves prompt-cache prefix order beyond the one-time bump
+    # from the SYSTEM_PROMPT rewrite for multi-principal awareness).
+    skills.append(build_privacy_skill())
     registry = SkillRegistry(skills)
     orch = Orchestrator(
         claude_client, store, registry,
         timezone=cfg.timezone,
         vault_path=cfg.vault_path,
         embedder=embedder,
+        principals=cfg.principals,
     )
     # Deep-think path (Opus 4.7 + adaptive / high effort) — only invoked via
     # the /think command, never by the main agent autonomously.
@@ -731,6 +156,7 @@ async def _run() -> None:
         timezone=cfg.timezone,
         vault_path=cfg.vault_path,
         embedder=embedder,
+        principals=cfg.principals,
     )
 
     app.bot_data["cfg"] = cfg
@@ -739,29 +165,13 @@ async def _run() -> None:
     app.bot_data["store"] = store
     app.bot_data["attachments"] = attachments
     app.bot_data["media_group_batches"] = {}
+    # bot_username is populated after `app.initialize()` below — used by the
+    # group-chat mention-gating logic. PTB caches `app.bot.username` after the
+    # first `get_me()` call inside initialize, so it's safe to read post-init.
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("save", on_save))
-    app.add_handler(CommandHandler("think", on_think))
-    # Attachment handlers — order doesn't matter, filters are disjoint.
-    attachment_filter = (
-        filters.PHOTO
-        | filters.Document.ALL
-        | filters.VIDEO
-        | filters.VOICE
-        | filters.AUDIO
-        | filters.ANIMATION
-    )
-    app.add_handler(MessageHandler(attachment_filter, on_attachment))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    register_handlers(app)
 
     stop_event = asyncio.Event()
-
-    async def _send_daily_prompt(chat_id: int, date_str: str) -> None:
-        text = DAILY_PROMPT_TEMPLATE.format(date=date_str)
-        await app.bot.send_message(chat_id=chat_id, text=text)
-        # Record so the user's reply loads this prompt as prior assistant context.
-        await store.record_proactive_message(chat_id, text)
 
     async def _sweep_nudges() -> None:
         """Deliver any due reminders. Called every nudge_sweep_interval_seconds."""
@@ -797,24 +207,18 @@ async def _run() -> None:
     scheduler_tasks: list[asyncio.Task[None]] = []
     try:
         await app.initialize()
+        # PTB has now called get_me() internally — pull the bot's username
+        # for group-chat mention gating. Lower-cased once so the comparison
+        # in `should_engage_in_group` doesn't have to.
+        try:
+            app.bot_data["bot_username"] = app.bot.username
+            logger.info("bot username resolved: @%s", app.bot.username)
+        except Exception:
+            logger.warning("could not resolve bot username; group mention gating disabled")
+            app.bot_data["bot_username"] = None
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         logger.info("gateway running")
-
-        if cfg.schedule_enabled:
-            scheduler_tasks.append(asyncio.create_task(
-                run_daily_scheduler(
-                    chat_id=cfg.allowed_user_id,
-                    hour=cfg.daily_reflection_hour,
-                    minute=cfg.daily_reflection_minute,
-                    tz_name=cfg.timezone,
-                    on_fire=_send_daily_prompt,
-                    stop_event=stop_event,
-                ),
-                name="yunam-daily-scheduler",
-            ))
-        else:
-            logger.info("daily retrospective disabled (YUNAM_SCHEDULE_ENABLED is not set)")
 
         if cfg.nudge_sweeper_enabled:
             scheduler_tasks.append(asyncio.create_task(

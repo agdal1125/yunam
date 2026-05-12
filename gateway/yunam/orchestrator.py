@@ -19,11 +19,47 @@ from zoneinfo import ZoneInfo
 
 from langgraph.graph import END, START, StateGraph
 
+from .config import Principal
 from .context_primer import build_preference_context
 from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
 from .skills.base import DispatchContext, SkillRegistry
 from .tools.vault import VaultError
+
+
+# Substring triggers for the privacy heuristic. Hit on any of these and the
+# turn is auto-marked `private:<speaker>` before persistence — first line of
+# defense for "이건 비밀이야" without forcing the model to call the tool.
+# False positives (e.g. "그건 비밀이 아니야") just over-protect, which is the
+# safer failure mode for multi-principal chats.
+_PRIVACY_TRIGGERS: tuple[str, ...] = (
+    "비밀이야", "비밀이지", "비밀이니", "비밀이라",
+    "비밀로 해", "비밀로 하자", "비밀로 가자", "비밀로 둘",
+    "비밀로 부탁", "비밀로 알",
+    "와이프한테 말하지", "와이프한테는 비밀", "와이프 모르게",
+    "유림한테 말하지", "유림이한테 말하지", "유림 모르게",
+    "둘만 알", "둘이만 알", "너만 알아", "너만 알고",
+    "혼자만 알", "오프 더 레코드", "오프더레코드",
+    "off the record", "don't tell", "do not tell",
+    "between us", "just between us", "keep this private",
+)
+
+
+def _detect_private_visibility(user_text: str, speaker_user_id: int | None) -> str:
+    """Return 'private:<id>' if the heuristic triggers, else 'shared'.
+
+    Conservative: any substring match wins — we'd rather over-mark than leak.
+    The model can still call `mark_turn_private` when the heuristic misses;
+    the heuristic exists so the common case doesn't depend on the model
+    remembering to invoke a tool.
+    """
+    if speaker_user_id is None:
+        return "shared"
+    lowered = user_text.lower()
+    for trigger in _PRIVACY_TRIGGERS:
+        if trigger in user_text or trigger in lowered:
+            return f"private:{int(speaker_user_id)}"
+    return "shared"
 
 
 class _TextEmbedder(Protocol):
@@ -48,6 +84,12 @@ class AgentState(TypedDict):
     history: list[dict[str, Any]]
     response_text: str
     tool_calls: list[ToolCall]
+    # v6: multi-principal — speaker identity threaded through every node so
+    # _load_history_node can ACL-filter by viewer and _persist_node can write
+    # the visibility column. principal=None is reserved for legacy/test paths
+    # that don't need ACL filtering.
+    principal: Principal | None
+    visibility: str
 
 
 class ClaudeClient(Protocol):
@@ -105,6 +147,7 @@ class Orchestrator:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         thinking: dict[str, Any] | None = None,
         output_config: dict[str, Any] | None = None,
+        principals: tuple[Principal, ...] = (),
     ):
         self._claude = claude_client
         self._store = store
@@ -116,6 +159,14 @@ class Orchestrator:
         self._max_tokens = max_tokens
         self._thinking = thinking
         self._output_config = output_config
+        # principals — frozen at construction so the rendered `[from: <name>]`
+        # markers in history are stable for prompt-cache friendliness. Adding
+        # a principal requires a gateway restart, which is the same rule we
+        # already apply to YUNAM_PRINCIPALS env changes.
+        self._principals: tuple[Principal, ...] = tuple(principals)
+        self._principals_by_id: dict[int, Principal] = {
+            p.user_id: p for p in self._principals
+        }
         # Background embed tasks are tracked so the asyncio runtime keeps a
         # strong reference to them (otherwise they may be GC'd mid-flight).
         # The done-callback self-unregisters.
@@ -150,6 +201,7 @@ class Orchestrator:
         user_text: str,
         *,
         user_content: list[dict[str, Any]] | None = None,
+        principal: Principal | None = None,
     ) -> str:
         initial: AgentState = {
             "chat_id": chat_id,
@@ -158,6 +210,10 @@ class Orchestrator:
             "history": [],
             "response_text": "",
             "tool_calls": [],
+            "principal": principal,
+            "visibility": _detect_private_visibility(
+                user_text, principal.user_id if principal else None
+            ),
         }
         final = await self._graph.ainvoke(initial)
         return final["response_text"]
@@ -165,8 +221,31 @@ class Orchestrator:
     # ---- nodes -------------------------------------------------------------
 
     async def _load_history_node(self, state: AgentState) -> dict[str, Any]:
-        history = await self._store.load_history(state["chat_id"])
-        return {"history": history}
+        principal = state.get("principal")
+        viewer_user_id = principal.user_id if principal else None
+        raw = await self._store.load_history(
+            state["chat_id"], viewer_user_id=viewer_user_id
+        )
+        # Render history for Claude:
+        #  - assistant messages stay as plain `{role, content}` strings
+        #  - user messages get a `[from: <name>]` prefix so the model knows
+        #    who said each thing in a multi-principal chat. We resolve names
+        #    from the principal allowlist; unknown user_id (legacy / removed
+        #    principal) renders as `[from: user-<id>]`. NULL user_id
+        #    (pre-v6 backfill or proactive scheduler messages) is treated as
+        #    'shared' / unknown — no prefix.
+        principals = self._principals_by_id
+        rendered: list[dict[str, str]] = []
+        for entry in raw:
+            role = entry["role"]
+            content = entry["content"]
+            uid = entry.get("user_id")
+            if role == "user" and uid is not None:
+                speaker = principals.get(int(uid))
+                name = speaker.name if speaker else f"user-{int(uid)}"
+                content = f"[from: {name}]\n{content}"
+            rendered.append({"role": role, "content": content})
+        return {"history": rendered}
 
     async def _agent_step_node(self, state: AgentState) -> dict[str, Any]:
         messages: list[dict[str, Any]] = list(state["history"])
@@ -176,9 +255,13 @@ class Orchestrator:
         now_local = datetime.now(self._tz)
         date_tag = now_local.strftime("%Y-%m-%d %H:%M %Z")
         primer = await build_preference_context(state["user_text"], self._vault_path)
-        prelude = f"[meta: now is {date_tag}]"
+        principal = state.get("principal")
+        prelude_parts = [f"[meta: now is {date_tag}]"]
+        if principal is not None:
+            prelude_parts.append(f"[from: {principal.name}]")
         if primer:
-            prelude = f"{prelude}\n\n{primer}"
+            prelude_parts.append(primer)
+        prelude = "\n\n".join(prelude_parts)
         wrapped = f"{prelude}\n\n{state['user_text']}"
         if state.get("user_content"):
             turn_content = list(state["user_content"] or [])
@@ -192,6 +275,22 @@ class Orchestrator:
             messages.append({"role": "user", "content": turn_content})
         else:
             messages.append({"role": "user", "content": wrapped})
+
+        # Shared dispatch context for every tool handler invoked this turn.
+        # `turn_meta` is mutable scratch — the privacy skill writes
+        # `visibility` here and we read it back after the loop. Seeding it
+        # with the heuristic-derived visibility ensures the tool's only role
+        # is to OVERRIDE the default, not to invent visibility from nothing.
+        turn_meta: dict[str, Any] = {
+            "visibility": state.get("visibility", "shared"),
+            "visibility_source": "heuristic",
+        }
+        dispatch_ctx = DispatchContext(
+            chat_id=state["chat_id"],
+            principal_user_id=principal.user_id if principal else None,
+            principal_name=principal.name if principal else None,
+            turn_meta=turn_meta,
+        )
 
         tool_calls_log: list[ToolCall] = []
         final_response: Any = None
@@ -276,7 +375,7 @@ class Orchestrator:
                     handler_inputs = inputs if isinstance(inputs, dict) else {}
                     result = await tool_spec.handler(
                         handler_inputs,
-                        DispatchContext(chat_id=state["chat_id"]),
+                        dispatch_ctx,
                     )
                 except VaultError as e:
                     result = f"Tool error: {e}"
@@ -300,6 +399,9 @@ class Orchestrator:
                         elapsed_ms=elapsed_ms,
                         skill_id=skill_id,
                         scope=scope,
+                        principal_user_id=(
+                            principal.user_id if principal else None
+                        ),
                     )
                 )
                 tool_results.append(
@@ -322,14 +424,26 @@ class Orchestrator:
         response_text = (
             _extract_text(final_response.content) if final_response else "(no response)"
         )
-        return {"response_text": response_text, "tool_calls": tool_calls_log}
+        # turn_meta['visibility'] may have been overridden by the privacy
+        # skill mid-loop; read it back here so _persist_node sees the final
+        # value. The default ('shared') is what the heuristic seeded, so
+        # missing key would still be safe — explicit anyway.
+        final_visibility = turn_meta.get("visibility", state.get("visibility", "shared"))
+        return {
+            "response_text": response_text,
+            "tool_calls": tool_calls_log,
+            "visibility": final_visibility,
+        }
 
     async def _persist_node(self, state: AgentState) -> dict[str, Any]:
+        principal = state.get("principal")
         user_msg_id, assistant_msg_id = await self._store.persist_turn(
             chat_id=state["chat_id"],
             user_text=state["user_text"],
             assistant_text=state["response_text"],
             tool_calls=state["tool_calls"],
+            principal_user_id=principal.user_id if principal else None,
+            visibility=state.get("visibility", "shared"),
         )
         # Fire-and-forget embed of the combined turn. Keeps Telegram reply
         # latency unchanged; on failure the turn exists in DB but isn't

@@ -193,7 +193,10 @@ async def _run(real: bool, chat_id: int) -> None:
     store = await SessionStore.open(db_path)
     tools = ObsidianTools(vault)
     # REPL runs with only the obsidian skill — no attachments. The registry
-    # still flattens exactly the tools the fake Claude client expects.
+    # still flattens exactly the tools the fake Claude client expects. The
+    # orchestrator accepts an empty `principals` tuple — handle_turn() with
+    # principal=None is the legacy single-user code path and keeps existing
+    # smoke flows working without an env-driven Principal allowlist.
     registry = SkillRegistry([build_obsidian_skill(tools)])
     orch = Orchestrator(client, store, registry)
 

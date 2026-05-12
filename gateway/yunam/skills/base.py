@@ -13,23 +13,32 @@ sent to Claude as-is on every turn, and a single reorder invalidates the cache.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Sequence
 
 from ..capabilities import Scope
 from ..tools.vault import VaultError
 
 
-@dataclass(frozen=True)
+@dataclass
 class DispatchContext:
     """Per-turn context passed to every tool handler.
 
-    Kept intentionally minimal — add fields when an actual tool needs them, not
-    speculatively. `chat_id` is here because attachment tools branch on it
-    (pending-attachment lookup, retrieval destination).
+    `chat_id` is here because attachment tools branch on it (pending-attachment
+    lookup, retrieval destination). `principal_user_id` and `principal_name`
+    identify the speaker for multi-principal flows — memory recall uses the
+    user_id for ACL filtering, prompts/tool replies use the name. `turn_meta`
+    is a mutable scratch dict shared across every tool handler invoked in the
+    same turn — currently used by the privacy skill to mark the turn private,
+    which the orchestrator reads at persist time. Tools must namespace their
+    keys (e.g. `'visibility'`) and never assume turn_meta carries forward
+    across turns.
     """
 
     chat_id: int
+    principal_user_id: int | None = None
+    principal_name: str | None = None
+    turn_meta: dict[str, Any] = field(default_factory=dict)
 
 
 ToolHandler = Callable[[dict[str, Any], DispatchContext], Awaitable[str]]

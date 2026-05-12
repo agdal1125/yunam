@@ -36,20 +36,33 @@ CREATE TABLE IF NOT EXISTS messages (
     chat_id       INTEGER NOT NULL REFERENCES sessions(chat_id),
     role          TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content       TEXT NOT NULL,
-    created_at    TEXT NOT NULL
+    created_at    TEXT NOT NULL,
+    -- Multi-principal additions (v6). For role='user', user_id is the speaker's
+    -- Telegram user id; for role='assistant' it's NULL (no human author).
+    -- visibility is 'shared' (every principal in the chat may load/recall it)
+    -- or 'private:<user_id>' (only that principal may load/recall it). The
+    -- DB-side filter in load_history / search_messages_semantic is the primary
+    -- ACL; the prompt-side instruction is defense in depth.
+    user_id       INTEGER,
+    visibility    TEXT NOT NULL DEFAULT 'shared'
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_created ON messages(chat_id, created_at);
+-- idx_messages_visibility is created inside the v6 migration step, AFTER the
+-- visibility column is added on upgrade DBs. Leaving it here would cause
+-- `executescript` to fail on a pre-v6 DB before the ALTER TABLE has run.
 
 CREATE TABLE IF NOT EXISTS tool_calls (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id         INTEGER NOT NULL REFERENCES sessions(chat_id),
-    turn_message_id INTEGER REFERENCES messages(id),
-    name            TEXT NOT NULL,
-    input_json      TEXT NOT NULL,
-    result_preview  TEXT,
-    is_error        INTEGER NOT NULL DEFAULT 0,
-    elapsed_ms      INTEGER,
-    created_at      TEXT NOT NULL
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id             INTEGER NOT NULL REFERENCES sessions(chat_id),
+    turn_message_id     INTEGER REFERENCES messages(id),
+    name                TEXT NOT NULL,
+    input_json          TEXT NOT NULL,
+    result_preview      TEXT,
+    is_error            INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms          INTEGER,
+    created_at          TEXT NOT NULL,
+    -- v6: which principal triggered this dispatch. NULL on legacy rows.
+    principal_user_id   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_chat ON tool_calls(chat_id, created_at);
 
@@ -110,10 +123,16 @@ CREATE TABLE IF NOT EXISTS message_turns (
     user_message_id      INTEGER NOT NULL REFERENCES messages(id),
     user_text            TEXT NOT NULL,
     assistant_text       TEXT NOT NULL,
-    created_at           TEXT NOT NULL
+    created_at           TEXT NOT NULL,
+    -- Mirror messages.user_id / visibility so recall can ACL-filter without
+    -- re-joining messages. user_id = the speaker of user_message_id.
+    user_id              INTEGER,
+    visibility           TEXT NOT NULL DEFAULT 'shared'
 );
 CREATE INDEX IF NOT EXISTS idx_message_turns_chat_created
     ON message_turns(chat_id, created_at DESC);
+-- idx_message_turns_visibility is created inside the v6 migration step,
+-- AFTER the visibility column is added on upgrade DBs.
 """
 
 # Voyage `voyage-multimodal-3` returns 1024-dim float vectors.
@@ -138,7 +157,7 @@ HISTORY_LIMIT = 20
 # Schema version — bump when a migration is added below, and gate the new step
 # on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
 # must be idempotent.
-DB_USER_VERSION = 5
+DB_USER_VERSION = 6
 
 
 async def _column_exists(
@@ -174,6 +193,35 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         if not await _column_exists(db, "pending_attachments", "media_group_id"):
             await db.execute("ALTER TABLE pending_attachments ADD COLUMN media_group_id TEXT")
 
+    # v6: multi-principal — messages and message_turns gain `user_id` (speaker)
+    # and `visibility` (shared / private:<user_id>) for the per-speaker ACL.
+    # tool_calls gains principal_user_id for audit. Backfill leaves user_id
+    # NULL on legacy rows; load_history treats NULL user_id as 'shared' so the
+    # historical solo-user data stays visible to every principal.
+    if version < 6:
+        if not await _column_exists(db, "messages", "user_id"):
+            await db.execute("ALTER TABLE messages ADD COLUMN user_id INTEGER")
+        if not await _column_exists(db, "messages", "visibility"):
+            await db.execute(
+                "ALTER TABLE messages ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'"
+            )
+        if not await _column_exists(db, "message_turns", "user_id"):
+            await db.execute("ALTER TABLE message_turns ADD COLUMN user_id INTEGER")
+        if not await _column_exists(db, "message_turns", "visibility"):
+            await db.execute(
+                "ALTER TABLE message_turns ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'"
+            )
+        if not await _column_exists(db, "tool_calls", "principal_user_id"):
+            await db.execute("ALTER TABLE tool_calls ADD COLUMN principal_user_id INTEGER")
+        # Indexes are CREATE IF NOT EXISTS so re-running is safe.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_visibility ON messages(chat_id, visibility)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_message_turns_visibility "
+            "ON message_turns(chat_id, visibility)"
+        )
+
     if version < DB_USER_VERSION:
         await db.execute(f"PRAGMA user_version = {DB_USER_VERSION}")
         logger.info(
@@ -206,6 +254,9 @@ class ToolCall:
     # tracks which capability the tool claimed, as a string for DB portability.
     skill_id: str | None = None
     scope: str | None = None
+    # v6: which principal triggered this call. NULL only when persist runs
+    # outside a turn context (no current speaker, e.g. system-driven proactive).
+    principal_user_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -253,6 +304,10 @@ class RecalledTurn:
     assistant_text: str
     created_at: str
     distance: float
+    # v6: speaker of the user side of this turn. None for legacy rows. The
+    # memory tool uses this to render a `[from: <name>]` marker in recall
+    # output so a multi-principal recall is unambiguous.
+    user_id: int | None = None
 
 
 class SessionStore:
@@ -302,34 +357,80 @@ class SessionStore:
             raise RuntimeError("SessionStore is not open")
         return self._db
 
-    async def load_history(self, chat_id: int) -> list[dict[str, str]]:
-        """Return last HISTORY_LIMIT messages as [{role, content}] in chronological order.
+    async def load_history(
+        self,
+        chat_id: int,
+        *,
+        viewer_user_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return last HISTORY_LIMIT messages visible to `viewer_user_id`.
 
-        The current turn's user message is NOT included — the orchestrator appends it.
+        Visibility ACL: a row is visible iff `visibility = 'shared'` or
+        `visibility = 'private:<viewer_user_id>'`. NULL `viewer_user_id`
+        bypasses the ACL — used by maintenance scripts; never by the live
+        orchestrator. The shape returned is a list of `{role, content, user_id}`
+        in chronological order. The current turn's user message is NOT included
+        — the orchestrator appends it.
+
+        `user_id` is included so the orchestrator can prefix multi-principal
+        history with `[from: <name>]` markers when rendering for Claude.
         """
         db = self._conn
-        async with db.execute(
-            """
-            SELECT role, content FROM (
-                SELECT role, content, created_at, id FROM messages
-                WHERE chat_id = ?
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-            ) ORDER BY created_at ASC, id ASC
-            """,
-            (chat_id, HISTORY_LIMIT),
-        ) as cursor:
-            rows = await cursor.fetchall()
-        return [{"role": role, "content": content} for role, content in rows]
+        if viewer_user_id is None:
+            async with db.execute(
+                """
+                SELECT role, content, user_id FROM (
+                    SELECT role, content, user_id, created_at, id
+                    FROM messages
+                    WHERE chat_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                ) ORDER BY created_at ASC, id ASC
+                """,
+                (chat_id, HISTORY_LIMIT),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        else:
+            private_marker = f"private:{int(viewer_user_id)}"
+            async with db.execute(
+                """
+                SELECT role, content, user_id FROM (
+                    SELECT role, content, user_id, created_at, id
+                    FROM messages
+                    WHERE chat_id = ?
+                      AND (visibility = 'shared' OR visibility = ?)
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT ?
+                ) ORDER BY created_at ASC, id ASC
+                """,
+                (chat_id, private_marker, HISTORY_LIMIT),
+            ) as cursor:
+                rows = await cursor.fetchall()
+        return [
+            {"role": role, "content": content, "user_id": user_id}
+            for role, content, user_id in rows
+        ]
 
-    async def record_proactive_message(self, chat_id: int, text: str) -> None:
+    async def record_proactive_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        target_user_id: int | None = None,
+    ) -> None:
         """Record an assistant-initiated message (e.g. nightly retrospective prompt).
 
         Writes the session row (upsert) and an `assistant` message, so the next
-        user reply's `load_history` sees Yunam's prompt as prior context.
+        user reply's `load_history` sees Yunam's prompt as prior context. If
+        `target_user_id` is set, the message is private to that principal — used
+        for nudges/retrospective prompts directed at a specific person in a
+        shared chat. Default `None` → 'shared' so legacy callers stay correct.
         """
         db = self._conn
         now = _now_iso()
+        visibility = (
+            f"private:{int(target_user_id)}" if target_user_id is not None else "shared"
+        )
         await db.execute("BEGIN")
         try:
             await db.execute(
@@ -341,8 +442,11 @@ class SessionStore:
                 (chat_id, now, now),
             )
             await db.execute(
-                "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
-                (chat_id, text, now),
+                """
+                INSERT INTO messages (chat_id, role, content, created_at, visibility)
+                VALUES (?, 'assistant', ?, ?, ?)
+                """,
+                (chat_id, text, now, visibility),
             )
             await db.commit()
         except Exception:
@@ -355,12 +459,22 @@ class SessionStore:
         user_text: str,
         assistant_text: str,
         tool_calls: list[ToolCall],
+        *,
+        principal_user_id: int | None = None,
+        visibility: str = "shared",
     ) -> tuple[int, int]:
         """Write one full turn (user + assistant + tool calls + turn index) atomically.
 
         Returns `(user_message_id, assistant_message_id)` so the caller can
         schedule a background embedding task keyed to the assistant message.
         Does not embed — that's the orchestrator's job.
+
+        `principal_user_id` identifies the speaker; both user and assistant
+        rows get this value for the user side and NULL for the assistant
+        side respectively (assistant has no human author). `visibility`
+        applies to both rows in the turn — yunam's response inherits the
+        visibility of the user message that triggered it, so a recall by
+        another principal doesn't leak the assistant half of a private turn.
         """
         db = self._conn
         now = _now_iso()
@@ -375,24 +489,32 @@ class SessionStore:
                 (chat_id, now, now),
             )
             async with db.execute(
-                "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'user', ?, ?)",
-                (chat_id, user_text, now),
+                """
+                INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
+                VALUES (?, 'user', ?, ?, ?, ?)
+                """,
+                (chat_id, user_text, now, principal_user_id, visibility),
             ) as cur:
                 user_msg_id = cur.lastrowid
             async with db.execute(
-                "INSERT INTO messages (chat_id, role, content, created_at) VALUES (?, 'assistant', ?, ?)",
-                (chat_id, assistant_text, now),
+                """
+                INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
+                VALUES (?, 'assistant', ?, ?, NULL, ?)
+                """,
+                (chat_id, assistant_text, now, visibility),
             ) as cur:
                 assistant_msg_id = cur.lastrowid
             await db.execute(
                 """
                 INSERT INTO message_turns
                     (assistant_message_id, chat_id, user_message_id,
-                     user_text, assistant_text, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                     user_text, assistant_text, created_at,
+                     user_id, visibility)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (assistant_msg_id, chat_id, user_msg_id,
-                 user_text, assistant_text, now),
+                 user_text, assistant_text, now,
+                 principal_user_id, visibility),
             )
 
             if tool_calls:
@@ -401,8 +523,8 @@ class SessionStore:
                     INSERT INTO tool_calls
                         (chat_id, turn_message_id, name, input_json,
                          result_preview, is_error, elapsed_ms, created_at,
-                         skill_id, scope)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         skill_id, scope, principal_user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
@@ -416,6 +538,11 @@ class SessionStore:
                             now,
                             tc.skill_id,
                             tc.scope,
+                            (
+                                tc.principal_user_id
+                                if tc.principal_user_id is not None
+                                else principal_user_id
+                            ),
                         )
                         for tc in tool_calls
                     ],
@@ -691,32 +818,56 @@ class SessionStore:
         chat_id: int,
         query_embedding: list[float],
         limit: int = 5,
+        *,
+        viewer_user_id: int | None = None,
     ) -> list[RecalledTurn]:
-        """KNN over embedded turns, scoped to a single chat.
+        """KNN over embedded turns, scoped to a single chat and visibility ACL.
 
         Returns `RecalledTurn` ordered by ascending distance. Empty list if
         sqlite-vec isn't loaded or the chat has no embedded turns yet.
+
+        Visibility ACL: a turn is recallable iff `visibility = 'shared'` or
+        `visibility = 'private:<viewer_user_id>'`. NULL viewer_user_id
+        bypasses the ACL — used for tests/maintenance only. The over-fetch
+        widens further when filtering so private rows pruned post-KNN don't
+        starve the result set.
         """
         if not self._has_vec:
             return []
         db = self._conn
         packed = _pack_embedding(query_embedding)
-        # Over-fetch from vec0 then filter by chat_id — vec0 doesn't natively
-        # support WHERE predicates beyond MATCH + k, and our scale is tiny.
-        overfetch_k = max(limit * 4, 20)
-        async with db.execute(
-            f"""
-            SELECT t.assistant_message_id, t.chat_id, t.user_text, t.assistant_text,
-                   t.created_at, me.distance
-            FROM message_embeddings me
-            JOIN message_turns t ON t.assistant_message_id = me.assistant_message_id
-            WHERE me.embedding MATCH ? AND k = {int(overfetch_k)}
-              AND t.chat_id = ?
-            ORDER BY me.distance
-            LIMIT ?
-            """,
-            (packed, chat_id, int(limit)),
-        ) as cur:
+        # Over-fetch from vec0 then filter by chat_id + visibility — vec0
+        # doesn't natively support WHERE predicates beyond MATCH + k, and our
+        # scale is tiny. Bump the multiplier when we're filtering so visibility
+        # pruning doesn't shrink the result below `limit`.
+        overfetch_k = max(limit * (8 if viewer_user_id is not None else 4), 32)
+        if viewer_user_id is None:
+            sql = f"""
+                SELECT t.assistant_message_id, t.chat_id, t.user_text, t.assistant_text,
+                       t.created_at, me.distance, t.user_id
+                FROM message_embeddings me
+                JOIN message_turns t ON t.assistant_message_id = me.assistant_message_id
+                WHERE me.embedding MATCH ? AND k = {int(overfetch_k)}
+                  AND t.chat_id = ?
+                ORDER BY me.distance
+                LIMIT ?
+            """
+            params: tuple[Any, ...] = (packed, chat_id, int(limit))
+        else:
+            private_marker = f"private:{int(viewer_user_id)}"
+            sql = f"""
+                SELECT t.assistant_message_id, t.chat_id, t.user_text, t.assistant_text,
+                       t.created_at, me.distance, t.user_id
+                FROM message_embeddings me
+                JOIN message_turns t ON t.assistant_message_id = me.assistant_message_id
+                WHERE me.embedding MATCH ? AND k = {int(overfetch_k)}
+                  AND t.chat_id = ?
+                  AND (t.visibility = 'shared' OR t.visibility = ?)
+                ORDER BY me.distance
+                LIMIT ?
+            """
+            params = (packed, chat_id, private_marker, int(limit))
+        async with db.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [
             RecalledTurn(
@@ -726,6 +877,7 @@ class SessionStore:
                 assistant_text=row[3],
                 created_at=row[4],
                 distance=float(row[5]),
+                user_id=row[6],
             )
             for row in rows
         ]

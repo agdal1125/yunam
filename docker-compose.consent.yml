@@ -23,7 +23,14 @@ services:
   calendar-mcp:
     network_mode: host
     environment:
-      - HOST=localhost
+      # IPv4 loopback specifically — node treats `localhost` as ::1 only on
+      # this host, which fails any SSH `-L 3000:localhost:3000` tunnel
+      # (OpenSSH resolves the remote `localhost` via its hostname resolver
+      # and tries 127.0.0.1 first). Binding to 127.0.0.1 keeps the consent
+      # endpoint host-local AND makes the standard tunnel form work.
+      # Google OAuth Desktop-app policy accepts 127.0.0.1 as a redirect
+      # host the same as `localhost`.
+      - HOST=127.0.0.1
     # Port publishing is irrelevant under host networking — the container IS
     # the host from a networking standpoint. Explicitly clear the base
     # compose's expose/port settings just for clarity.

@@ -93,6 +93,7 @@ def build_memory_skill(tools: MemoryTools) -> Skill:
             chat_id=ctx.chat_id,
             query=inputs.get("query", ""),
             limit=int(limit),
+            viewer_user_id=ctx.principal_user_id,
         )
 
     specs: tuple[ToolSpec, ...] = (

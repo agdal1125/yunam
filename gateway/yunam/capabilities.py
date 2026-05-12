@@ -31,6 +31,7 @@ class Scope(str, Enum):
     REMINDER_SCHEDULE = "reminder:schedule"
     MEMORY_READ = "memory:read"
     VAULT_GRAPH = "vault:graph"
+    PRIVACY_WRITE = "privacy:write"
 
     def __str__(self) -> str:
         return self.value

@@ -1,42 +1,100 @@
 # Yunam
 
-Personal AI assistant running 24/7 on a Vultr Tokyo VPS, controlled via Telegram. Claude Opus 4.7 with access to your Obsidian vault, a separate filevault for binary attachments (photos / docs / voice notes indexed for semantic search), and an optional nightly retrospective prompt.
+Personal AI assistant running 24/7 on a Vultr Tokyo VPS, controlled via Telegram. Dual-model architecture: Claude Sonnet 4.6 for everyday conversation, Opus 4.7 via `/think` for hard problems. Access to your Obsidian vault, a separate filevault for binary attachments (photos / docs / voice notes indexed for semantic search), web browsing, Google Calendar, air quality, parcel tracking, reminders, and long-term memory.
+
+Multi-principal: jaekeun (owner) and yoolim share the same bot with per-person privacy boundaries and memory isolation.
 
 For architecture decisions, the governance layer, secrets handling, and the phase roadmap, see [CLAUDE.md](CLAUDE.md).
 
 ## What it does (today)
 
-From Telegram:
+From Telegram (DM or authorized group chats):
 - `/start` → Yunam greets you.
-- Free-form chat → Claude Opus 4.7 replies, reading/writing your Obsidian vault as needed.
-- Send a photo / document / voice note → cached as "pending"; say "save this" (or `/save`) to commit it to the filevault with a Voyage multimodal embedding.
+- Free-form chat → Claude Sonnet 4.6 replies, reading/writing your Obsidian vault as needed.
+- `/think <query>` → Routes to Opus 4.7 with adaptive thinking for deeper reasoning.
+- `/diary [content]` → Manual daily reflection. Without content, sends a reflection prompt; with content, processes and saves to `daily/YYYY-MM-DD.md`.
+- Send a photo / document / voice note → cached as "pending"; say "save this" (or `/save`) to commit to the filevault with a Voyage multimodal embedding.
 - "Find that whiteboard photo from standup" → semantic search over saved files.
 - "Send me that receipt I saved last week" → Yunam retrieves and Telegram-attaches it.
-- Optional: nightly `22:30 KST` retrospective prompt; your reply lands in `daily/YYYY-MM-DD.md` in the vault.
-- A friend DMs the bot → silently ignored (logged at WARNING).
+- "오늘 서울 미세먼지 어때?" → air quality via Open-Meteo.
+- "택배 어디쯤이야?" → parcel tracking via Sweet Tracker.
+- "내일 3시에 알려줘" → reminders via the nudge sweeper.
+- "기억해: ..." → long-term memory with semantic recall.
+- Web search and page reading via Jina / DuckDuckGo.
+- Google Calendar integration (events, scheduling) via MCP sidecar.
+- `/chatid` → Echo the chat_id (for adding group chats to the allowlist).
+- Group-chat support with `@bot` mention, reply, or trigger-word gating (`유남아`, `yunam`, etc.).
+- Unknown users → silently ignored (logged at WARNING).
 
 ## Structure
 
 ```
 yunam/
-├── .env.example                   # Template — copy to .env and fill in
-├── docker-compose.yml
-├── scripts/repl.py                # Local dev REPL (fake or real Claude)
-├── data/yunam/                    # SQLite DB lives here (bind-mounted, gitignored)
+├── .env.example                     # Template — copy to .env and fill in
+├── docker-compose.yml               # gateway + optional calendar-mcp sidecar
+├── docker-compose.consent.yml       # One-time Google Calendar OAuth consent flow
+├── gcp-oauth.keys.json              # Google OAuth credentials (gitignored)
+├── scripts/
+│   ├── repl.py                      # Local dev REPL (fake or real Claude)
+│   ├── smoke_dual_model.py          # Smoke test: Sonnet + Opus paths
+│   ├── smoke_gcal.py                # Smoke test: Google Calendar MCP
+│   ├── smoke_korean.py              # Smoke test: Korean skills bundle
+│   ├── smoke_multiuser.py           # Smoke test: multi-principal flows
+│   └── smoke_web.py                 # Smoke test: web skill
+├── docs/
+│   └── gcal-setup.md                # Google Calendar MCP OAuth setup guide
+├── data/yunam/                      # SQLite DB lives here (bind-mounted, gitignored)
+├── mcp-servers/
+│   └── google-calendar-mcp/         # nspady/google-calendar-mcp (git submodule / clone)
 └── gateway/
-    ├── Dockerfile                 # python:3.12-slim + gosu for PUID/PGID
-    ├── entrypoint.sh              # uid remap → chown data → drop to appuser
-    ├── requirements.txt           # PTB + anthropic + langgraph + aiosqlite + voyageai + sqlite-vec + Pillow
-    ├── main.py                    # Telegram gateway, SkillRegistry wiring
-    └── yunam/
-        ├── orchestrator.py        # LangGraph + Claude tool loop
-        ├── sessions.py            # SQLite store + schema migrations
-        ├── capabilities.py        # Scope enum (vault:*, filevault:*)
-        ├── skills/                # Governance layer — add new skills here
-        ├── tools/                 # Low-level primitives (path safety, vault/filevault I/O)
-        ├── embeddings.py          # Voyage multimodal client
-        ├── scheduler.py           # Daily retrospective cron
-        └── prompts.py             # Core system prompt (skill fragments live in each skill module)
+    ├── Dockerfile                   # python:3.12-slim + gosu for PUID/PGID
+    ├── entrypoint.sh                # uid remap → chown data → drop to appuser
+    ├── requirements.txt             # PTB + anthropic + langgraph + aiosqlite + voyageai + ...
+    ├── main.py                      # Composition root — builds deps, registers handlers, lifecycle
+    ├── handlers/                    # Telegram handler definitions
+    │   ├── __init__.py              # register_handlers() — single entry point for main.py
+    │   ├── _helpers.py              # Shared constants (TELEGRAM_MSG_LIMIT, send_reply, ...)
+    │   ├── commands.py              # /start, /save, /think, /diary, /chatid
+    │   ├── text.py                  # Free-text handler + group-chat engagement logic
+    │   └── attachments.py           # Receive, batch (media-group), and process file uploads
+    └── yunam/                       # Core package
+        ├── config.py                # Env loading, Principal/Config dataclasses, logging setup
+        ├── auth.py                  # Principal resolution, chat allowlists, group triggers
+        ├── prompts.py               # Core SYSTEM_PROMPT + DAILY_PROMPT_TEMPLATE
+        ├── orchestrator.py          # LangGraph + Claude tool loop (SkillRegistry consumer)
+        ├── sessions.py              # aiosqlite store + schema migrations (7 tables)
+        ├── capabilities.py          # Scope enum (vault:*, filevault:*, web:*, ...)
+        ├── embeddings.py            # Voyage multimodal client
+        ├── context_primer.py        # Per-turn preference injection from Obsidian vault
+        ├── sender.py                # AttachmentSender Protocol + PTBSender
+        ├── vision.py                # Image content block helpers for inline vision
+        ├── files.py                 # Filevault path safety + name sanitization
+        ├── scheduler.py             # Nudge sweeper coroutine (reminder delivery loop)
+        ├── skills/                  # Governance layer — where new capabilities are added
+        │   ├── base.py              # Skill, ToolSpec, DispatchContext, SkillRegistry
+        │   ├── obsidian.py          # Obsidian vault skill (read/write/list/search)
+        │   ├── obsidian_graph.py    # Obsidian graph analysis (backlinks, orphans, structure)
+        │   ├── files.py             # Filevault skill (save/search/retrieve attachments)
+        │   ├── web.py               # Web browsing skill (search + page reading)
+        │   ├── airquality.py        # Air quality skill (Open-Meteo)
+        │   ├── parcel.py            # Parcel tracking skill (Sweet Tracker)
+        │   ├── reminders.py         # Reminders / nudges skill
+        │   ├── memory.py            # Long-term memory skill (semantic store)
+        │   └── privacy.py           # Privacy controls (mark_turn_private)
+        ├── tools/                   # Low-level primitives (no model/schema awareness)
+        │   ├── vault.py             # safe_join, size caps, atomic write
+        │   ├── obsidian.py          # ObsidianTools class
+        │   ├── obsidian_graph.py    # ObsidianGraphTools class
+        │   ├── attachments.py       # AttachmentTools class
+        │   ├── web.py               # WebTools class (Jina Reader + DuckDuckGo)
+        │   ├── airquality.py        # AirQualityTools class (Open-Meteo)
+        │   ├── parcel.py            # ParcelTools class (Sweet Tracker)
+        │   ├── reminders.py         # ReminderTools class
+        │   └── memory.py            # MemoryTools class
+        ├── mcp/                     # MCP server adapters (external tools via MCP protocol)
+        │   └── gcal.py              # Google Calendar adapter (nspady/google-calendar-mcp)
+        └── subagents/               # Separately-configured Claude calls
+            └── deep_think.py        # Opus 4.7 + adaptive thinking (invoked via /think)
 ```
 
 For the full file-by-file tour and the governance layer, see [CLAUDE.md](CLAUDE.md).
@@ -49,7 +107,12 @@ For the full file-by-file tour and the governance layer, see [CLAUDE.md](CLAUDE.
 - Anthropic API key from [console.anthropic.com](https://console.anthropic.com)
 - Voyage API key from [dash.voyageai.com](https://dash.voyageai.com) — for multimodal embeddings on saved files
 - A directory to serve as your Obsidian vault (create `~/obsidian` if it doesn't exist)
-- A directory for binary attachments, separate from the vault (defaults to `~/filevault`; created at first `/save`)
+- A directory for binary attachments, separate from the vault (defaults to `~/filevault`)
+
+Optional:
+- Jina API key from [jina.ai](https://jina.ai/reader) — enables Jina Search (web_search falls back to DuckDuckGo without it)
+- Sweet Tracker API key from [sweettracker.co.kr](http://info.sweettracker.co.kr/apikey/add) — parcel tracking
+- Google Calendar MCP setup — see [docs/gcal-setup.md](docs/gcal-setup.md)
 
 ## Local testing (no token burn)
 
@@ -79,8 +142,8 @@ PYTHONPATH=gateway python scripts/repl.py --real
 ```bash
 cp .env.example .env
 # Edit .env and fill in:
-#   TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID, ANTHROPIC_API_KEY, VOYAGE_API_KEY
-# Optional: YUNAM_SCHEDULE_ENABLED=1 to turn on the nightly retrospective.
+#   TELEGRAM_BOT_TOKEN, YUNAM_PRINCIPALS (or TELEGRAM_ALLOWED_USER_ID),
+#   ANTHROPIC_API_KEY, VOYAGE_API_KEY
 
 # macOS only: set PUID/PGID to your host user so vault writes land with the right owner.
 echo "PUID=$(id -u)" >> .env
@@ -89,12 +152,17 @@ echo "PGID=$(id -g)" >> .env
 mkdir -p ~/obsidian ~/filevault data/yunam
 
 docker compose up --build       # foreground; Ctrl+C to stop
+
+# With Google Calendar MCP (optional):
+docker compose --profile gcal up --build
 ```
 
 From your phone, DM [`@AgentYunamBot`](https://t.me/AgentYunamBot):
 
 - `/start` → greeting
 - any message → Yunam responds, with vault reads/writes as needed
+- `/think <question>` → deep reasoning via Opus 4.7
+- `/diary` → daily reflection prompt
 
 ## Deploy to the VPS
 
@@ -107,9 +175,8 @@ git clone git@github.com:agdal1125/yunam.git ~/yunam
 cd ~/yunam
 cp .env.example .env
 # Edit .env:
-#   - TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_USER_ID (same as local)
-#   - ANTHROPIC_API_KEY, VOYAGE_API_KEY
-#   - YUNAM_SCHEDULE_ENABLED=1 to enable the nightly retrospective
+#   - TELEGRAM_BOT_TOKEN, YUNAM_PRINCIPALS, ANTHROPIC_API_KEY, VOYAGE_API_KEY
+#   - YUNAM_NUDGE_SWEEPER_ENABLED=true to enable reminder delivery
 #   - Leave PUID=1000, PGID=1000 (VPS user is uid 1000)
 
 mkdir -p ~/obsidian ~/filevault data/yunam
@@ -135,7 +202,7 @@ docker compose up -d --build
 # From VPS host:
 sqlite3 data/yunam/yunam.db 'SELECT chat_id, role, substr(content,1,80) FROM messages ORDER BY id DESC LIMIT 10;'
 
-# Per-call audit with governance columns (skill_id + scope populated from v2 onward):
+# Per-call audit with governance columns:
 sqlite3 data/yunam/yunam.db \
   'SELECT name, skill_id, scope, is_error, elapsed_ms FROM tool_calls ORDER BY id DESC LIMIT 20;'
 
@@ -143,11 +210,14 @@ sqlite3 data/yunam/yunam.db \
 sqlite3 data/yunam/yunam.db \
   'SELECT skill_id, scope, COUNT(*) c FROM tool_calls GROUP BY skill_id, scope ORDER BY c DESC;'
 
-# Schema version (should be 2 after the governance migration):
+# Schema version:
 sqlite3 data/yunam/yunam.db 'PRAGMA user_version;'
 
 # Saved files (filevault index):
 sqlite3 data/yunam/yunam.db 'SELECT relpath, kind, mime_type, file_size FROM saved_files ORDER BY id DESC LIMIT 10;'
+
+# Pending reminders:
+sqlite3 data/yunam/yunam.db 'SELECT id, chat_id, fire_at, substr(message,1,60) FROM nudges WHERE sent_at IS NULL;'
 
 # See what Yunam has saved to the vault:
 ls -la ~/obsidian/ ~/filevault/
@@ -156,13 +226,29 @@ ls -la ~/obsidian/ ~/filevault/
 ## Roadmap
 
 - **Phase 1** — Agent core with Claude + Obsidian. **Done.**
-- **Phase 1.5** — Binary attachments + Voyage multimodal embeddings + nightly retrospective scheduler + skill/scope governance layer. **Done.**
-- **Phase 2+** — Specialist agents and MCP integrations, all wired through the governance layer. Finance Agent wraps the [MoneyFlow](../MoneyFlow) batch pipeline as a sibling Docker service (likely as an MCP server). See [CLAUDE.md § Governance](CLAUDE.md) for the checklists on adding a skill, MCP server, or sub-agent.
+- **Phase 1.5** — Binary attachments + Voyage multimodal embeddings + daily retrospective + skill/scope governance layer. **Done.**
+- **Phase 2** — Extended skills + integrations. **In progress.**
+  - [x] Web browsing (Jina Reader + DuckDuckGo)
+  - [x] Korean skills bundle (air quality, parcel tracking)
+  - [x] Reminders / nudge sweeper
+  - [x] Long-term memory with semantic recall
+  - [x] Multi-principal support (jaekeun + yoolim)
+  - [x] Group-chat support (mention/trigger-word gating)
+  - [x] Obsidian graph analysis (backlinks, orphans)
+  - [x] Deep-think path (`/think` → Opus 4.7)
+  - [x] Google Calendar MCP integration
+  - [x] Manual diary command (`/diary`)
+  - [x] Per-turn preference injection (context primer)
+  - [x] Handler modularization (handlers/ package)
+  - [ ] Finance Agent (MoneyFlow MCP integration)
+  - [ ] Evals and automated testing
 
 ## Security notes
 
 - `.env` is gitignored. Never commit real tokens or API keys.
-- Bot replies only to the user ID in `TELEGRAM_ALLOWED_USER_ID`. If that's wrong or empty, the bot ignores you — check the logs.
+- Bot replies only to principals listed in `YUNAM_PRINCIPALS`. Unknown users are silently ignored — check the logs.
+- Group chats require explicit opt-in via `YUNAM_ALLOWED_CHATS`.
 - Vault paths are sandboxed; `..` escapes and absolute paths are rejected before any filesystem call.
 - Size caps: 1 MB per read, 500 KB per write.
+- Per-principal privacy boundaries — private turns are filtered out of other principals' history.
 - If a token leaks, revoke via `/revoke` in `@BotFather` and update `.env`.
