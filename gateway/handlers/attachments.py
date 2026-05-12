@@ -323,10 +323,13 @@ async def _process_attachment_batch(
         return
 
     if not instruction:
-        await send_reply(
+        await _commit_pending_ids_and_send(
             bot,
-            chat_id,
-            "받았어. 저장하려면 /save를 보내거나, 무엇을 할지 말해줘.",
+            bot_data,
+            chat_id=chat_id,
+            pending_ids=pending_ids,
+            media_group_id=media_group_id,
+            caption_override=None,
             reply_to_message_id=reply_to_message_id,
         )
         return
