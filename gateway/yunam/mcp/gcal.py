@@ -125,8 +125,22 @@ class GCalMCPClient:
     async def connect(self) -> None:
         """Initialize the server side and cache its tool list.
 
+<<<<<<< HEAD
         Failing here crashes the gateway at boot (see main.py) — better to
         surface misconfiguration loudly than silently serve without calendar.
+=======
+        nspady runs in stateful mode with a single in-memory session per
+        server process. After a gateway restart the server still believes the
+        previous session is open and rejects a fresh `initialize` with
+        HTTP 400 + JSON-RPC error message "Server already initialized." We
+        catch that specific case and proceed without re-initializing — the
+        server still serves `tools/list` and `tools/call` against the
+        existing session.
+
+        Any other failure path (network, OAuth, mis-routed URL, schema
+        mismatch) still raises so main.py can decide whether to disable the
+        skill or fail-fast.
+>>>>>>> c68d3c9 (Seychelles commit job)
         """
         if self._http is not None:
             raise RuntimeError("GCalMCPClient already connected")
@@ -153,11 +167,30 @@ class GCalMCPClient:
                     "Accept": "application/json, text/event-stream",
                 },
             )
+<<<<<<< HEAD
             if init_response.status_code >= 400:
+=======
+
+            already_initialized = _is_already_initialized_error(init_response)
+            if already_initialized:
+                # Server believes a previous session is still active. Reuse
+                # whatever session-id it surfaces (may be None for single-
+                # session servers) and skip the notifications/initialized
+                # handshake — that's only required after a fresh initialize.
+                logger.warning(
+                    "gcal MCP: server reports 'already initialized'; "
+                    "reusing existing session and skipping handshake "
+                    "(see README — typically requires `docker restart "
+                    "yunam-calendar-mcp` if tools/list fails next)"
+                )
+                self._session_id = init_response.headers.get("mcp-session-id")
+            elif init_response.status_code >= 400:
+>>>>>>> c68d3c9 (Seychelles commit job)
                 body_preview = init_response.text[:500].replace("\n", " ")
                 raise RuntimeError(
                     f"MCP HTTP {init_response.status_code} on initialize: {body_preview}"
                 )
+<<<<<<< HEAD
             self._session_id = init_response.headers.get("mcp-session-id")
             if not self._session_id:
                 logger.warning(
@@ -179,6 +212,31 @@ class GCalMCPClient:
             # we replicate it here or nspady's server-side state machine
             # rejects subsequent tools/list / tools/call with HTTP 500.
             await self._notify("notifications/initialized", {})
+=======
+            else:
+                self._session_id = init_response.headers.get("mcp-session-id")
+                if not self._session_id:
+                    logger.warning(
+                        "gcal MCP: initialize response has no mcp-session-id header; "
+                        "server may not be in stateful mode — tools/list will likely 500"
+                    )
+                # Surface init-level errors embedded in the payload (protocol errors
+                # vs transport errors).
+                init_payload = _parse_mcp_response(init_response.text)
+                if isinstance(init_payload, dict) and "error" in init_payload:
+                    err = init_payload["error"]
+                    raise RuntimeError(
+                        f"MCP initialize error: code={err.get('code')} "
+                        f"msg={err.get('message')!r}"
+                    )
+                # MCP spec: after `initialize` response, the client MUST send the
+                # `notifications/initialized` notification before issuing further
+                # requests. The `mcp` SDK's ClientSession did this automatically;
+                # we replicate it here or nspady's server-side state machine
+                # rejects subsequent tools/list / tools/call with HTTP 500.
+                await self._notify("notifications/initialized", {})
+
+>>>>>>> c68d3c9 (Seychelles commit job)
             listed = await self._rpc("tools/list", {})
         except Exception:
             await self._http.aclose()
@@ -315,6 +373,28 @@ class GCalMCPClient:
             )
 
 
+<<<<<<< HEAD
+=======
+def _is_already_initialized_error(response: httpx.Response) -> bool:
+    """True if the response is the nspady stateful-session reinit rejection.
+
+    nspady answers a duplicate `initialize` (e.g. after a gateway restart
+    while the server kept its session) with HTTP 400 and a JSON-RPC error
+    payload whose `message` mentions "already initialized". We detect that
+    specific shape and recover; any other 4xx/5xx is a real problem.
+
+    Matching is intentionally loose: nspady's exact wording has varied
+    across versions ("Server already initialized.", "Session already
+    initialized", etc.). We require status==400 AND case-insensitive
+    "already initialized" in the body to avoid false positives.
+    """
+    if response.status_code != 400:
+        return False
+    body = response.text or ""
+    return "already initialized" in body.lower()
+
+
+>>>>>>> c68d3c9 (Seychelles commit job)
 def _parse_mcp_response(body: str) -> Any:
     """Parse either raw JSON or SSE-framed JSON response from nspady.
 
