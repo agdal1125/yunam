@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import uuid
 from typing import Any
 
@@ -43,6 +44,7 @@ import httpx
 from ..capabilities import Scope
 from ..skills.base import DispatchContext, Skill, ToolSpec
 from ..tools.vault import VaultError
+from ..usage import UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +117,19 @@ class GCalMCPClient:
     gateway startup to populate the tool cache, use `call_tool()` per turn.
     """
 
-    def __init__(self, url: str, timeout_s: float = DEFAULT_TIMEOUT_S):
+    def __init__(
+        self,
+        url: str,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+    ):
         self._url = url
         self._timeout_s = timeout_s
         self._http: httpx.AsyncClient | None = None
         self._session_id: str | None = None
         self._tools: tuple[dict[str, Any], ...] = ()
+        self._usage = usage_recorder
 
     async def connect(self) -> None:
         """Initialize the server side and cache its tool list.
@@ -256,20 +265,33 @@ class GCalMCPClient:
         """
         if self._http is None:
             raise VaultError("gcal MCP client is not connected")
+        t0 = time.monotonic()
+        rpc_status = "ok"
         try:
-            result = await self._rpc(
-                "tools/call",
-                {"name": name, "arguments": arguments},
-            )
-        except Exception as e:
-            logger.info("gcal call_tool %s failed: %r", name, e)
-            raise VaultError(f"gcal MCP error ({name}): {e}") from e
-        if not isinstance(result, dict):
-            return str(result)
-        text = _stringify_content(result.get("content"))
-        if result.get("isError"):
-            return f"Tool error: {text}"
-        return text
+            try:
+                result = await self._rpc(
+                    "tools/call",
+                    {"name": name, "arguments": arguments},
+                )
+            except Exception as e:
+                logger.info("gcal call_tool %s failed: %r", name, e)
+                rpc_status = "error"
+                raise VaultError(f"gcal MCP error ({name}): {e}") from e
+            if not isinstance(result, dict):
+                return str(result)
+            text = _stringify_content(result.get("content"))
+            if result.get("isError"):
+                rpc_status = "error"
+                return f"Tool error: {text}"
+            return text
+        finally:
+            if self._usage is not None:
+                self._usage.record_mcp(
+                    server="gcal",
+                    tool_name=name,
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    status=rpc_status,
+                )
 
     @property
     def tools(self) -> tuple[dict[str, Any], ...]:

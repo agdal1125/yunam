@@ -33,6 +33,7 @@ class Scope(str, Enum):
     VAULT_GRAPH = "vault:graph"
     PRIVACY_WRITE = "privacy:write"
     STOCK_SUPPLY_READ = "stock:supply_read"
+    USAGE_READ = "usage:read"
 
     def __str__(self) -> str:
         return self.value

@@ -8,6 +8,7 @@ file search. One SQLite database file, one connection, WAL mode.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import struct
@@ -133,6 +134,33 @@ CREATE INDEX IF NOT EXISTS idx_message_turns_chat_created
     ON message_turns(chat_id, created_at DESC);
 -- idx_message_turns_visibility is created inside the v6 migration step,
 -- AFTER the visibility column is added on upgrade DBs.
+
+-- Per-external-call audit. One row per paid API request (Anthropic message,
+-- Voyage embed, Jina/Sweet Tracker/Open-Meteo HTTP call, MCP tool invocation).
+-- Costs are stored as integer µUSD so summing 100k rows in SQLite stays exact.
+-- Token columns are nullable: a Sweet Tracker request has no tokens, just a
+-- units count. `chat_id` is nullable so background runners (curation worker,
+-- nightly reflector) can still record their usage.
+CREATE TABLE IF NOT EXISTS api_usage (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider            TEXT NOT NULL,
+    model_or_endpoint   TEXT NOT NULL,
+    chat_id             INTEGER,
+    skill_id            TEXT,
+    input_tokens        INTEGER,
+    output_tokens       INTEGER,
+    cache_read_tokens   INTEGER,
+    cache_create_tokens INTEGER,
+    units               INTEGER,
+    cost_usd_micro      INTEGER NOT NULL DEFAULT 0,
+    elapsed_ms          INTEGER,
+    status              TEXT NOT NULL DEFAULT 'ok',
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_usage_created
+    ON api_usage(created_at);
+CREATE INDEX IF NOT EXISTS idx_api_usage_provider_created
+    ON api_usage(provider, created_at);
 """
 
 # Voyage `voyage-multimodal-3` returns 1024-dim float vectors.
@@ -157,7 +185,7 @@ HISTORY_LIMIT = 20
 # Schema version — bump when a migration is added below, and gate the new step
 # on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
 # must be idempotent.
-DB_USER_VERSION = 6
+DB_USER_VERSION = 7
 
 
 async def _column_exists(
@@ -315,6 +343,15 @@ class SessionStore:
         self._db_path = db_path
         self._db: aiosqlite.Connection | None = None
         self._has_vec = False
+        # aiosqlite shares one Python sqlite3 connection across all coroutines.
+        # Python's sqlite3 driver auto-opens an implicit transaction on the
+        # first DML statement and only closes it on commit. When two coroutines
+        # interleave their write paths — e.g. a background `record_api_usage`
+        # INSERT yields control mid-transaction, then `persist_turn` calls
+        # explicit `BEGIN` — sqlite raises "cannot start a transaction within
+        # a transaction." Every method that issues a write (auto- or explicit-
+        # transaction) acquires this lock to serialize transactions cleanly.
+        self._write_lock: asyncio.Lock = asyncio.Lock()
 
     @classmethod
     async def open(cls, db_path: Path) -> "SessionStore":
@@ -431,27 +468,28 @@ class SessionStore:
         visibility = (
             f"private:{int(target_user_id)}" if target_user_id is not None else "shared"
         )
-        await db.execute("BEGIN")
-        try:
-            await db.execute(
-                """
-                INSERT INTO sessions (chat_id, created_at, last_seen_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-                """,
-                (chat_id, now, now),
-            )
-            await db.execute(
-                """
-                INSERT INTO messages (chat_id, role, content, created_at, visibility)
-                VALUES (?, 'assistant', ?, ?, ?)
-                """,
-                (chat_id, text, now, visibility),
-            )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
+                    """
+                    INSERT INTO sessions (chat_id, created_at, last_seen_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+                    """,
+                    (chat_id, now, now),
+                )
+                await db.execute(
+                    """
+                    INSERT INTO messages (chat_id, role, content, created_at, visibility)
+                    VALUES (?, 'assistant', ?, ?, ?)
+                    """,
+                    (chat_id, text, now, visibility),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
 
     async def persist_turn(
         self,
@@ -478,79 +516,80 @@ class SessionStore:
         """
         db = self._conn
         now = _now_iso()
-        await db.execute("BEGIN")
-        try:
-            await db.execute(
-                """
-                INSERT INTO sessions (chat_id, created_at, last_seen_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(chat_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-                """,
-                (chat_id, now, now),
-            )
-            async with db.execute(
-                """
-                INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
-                VALUES (?, 'user', ?, ?, ?, ?)
-                """,
-                (chat_id, user_text, now, principal_user_id, visibility),
-            ) as cur:
-                user_msg_id = cur.lastrowid
-            async with db.execute(
-                """
-                INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
-                VALUES (?, 'assistant', ?, ?, NULL, ?)
-                """,
-                (chat_id, assistant_text, now, visibility),
-            ) as cur:
-                assistant_msg_id = cur.lastrowid
-            await db.execute(
-                """
-                INSERT INTO message_turns
-                    (assistant_message_id, chat_id, user_message_id,
-                     user_text, assistant_text, created_at,
-                     user_id, visibility)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (assistant_msg_id, chat_id, user_msg_id,
-                 user_text, assistant_text, now,
-                 principal_user_id, visibility),
-            )
-
-            if tool_calls:
-                await db.executemany(
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                await db.execute(
                     """
-                    INSERT INTO tool_calls
-                        (chat_id, turn_message_id, name, input_json,
-                         result_preview, is_error, elapsed_ms, created_at,
-                         skill_id, scope, principal_user_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO sessions (chat_id, created_at, last_seen_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
                     """,
-                    [
-                        (
-                            chat_id,
-                            assistant_msg_id,
-                            tc.name,
-                            json.dumps(tc.input, ensure_ascii=False),
-                            tc.result_preview,
-                            1 if tc.is_error else 0,
-                            tc.elapsed_ms,
-                            now,
-                            tc.skill_id,
-                            tc.scope,
-                            (
-                                tc.principal_user_id
-                                if tc.principal_user_id is not None
-                                else principal_user_id
-                            ),
-                        )
-                        for tc in tool_calls
-                    ],
+                    (chat_id, now, now),
                 )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+                async with db.execute(
+                    """
+                    INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
+                    VALUES (?, 'user', ?, ?, ?, ?)
+                    """,
+                    (chat_id, user_text, now, principal_user_id, visibility),
+                ) as cur:
+                    user_msg_id = cur.lastrowid
+                async with db.execute(
+                    """
+                    INSERT INTO messages (chat_id, role, content, created_at, user_id, visibility)
+                    VALUES (?, 'assistant', ?, ?, NULL, ?)
+                    """,
+                    (chat_id, assistant_text, now, visibility),
+                ) as cur:
+                    assistant_msg_id = cur.lastrowid
+                await db.execute(
+                    """
+                    INSERT INTO message_turns
+                        (assistant_message_id, chat_id, user_message_id,
+                         user_text, assistant_text, created_at,
+                         user_id, visibility)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (assistant_msg_id, chat_id, user_msg_id,
+                     user_text, assistant_text, now,
+                     principal_user_id, visibility),
+                )
+
+                if tool_calls:
+                    await db.executemany(
+                        """
+                        INSERT INTO tool_calls
+                            (chat_id, turn_message_id, name, input_json,
+                             result_preview, is_error, elapsed_ms, created_at,
+                             skill_id, scope, principal_user_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            (
+                                chat_id,
+                                assistant_msg_id,
+                                tc.name,
+                                json.dumps(tc.input, ensure_ascii=False),
+                                tc.result_preview,
+                                1 if tc.is_error else 0,
+                                tc.elapsed_ms,
+                                now,
+                                tc.skill_id,
+                                tc.scope,
+                                (
+                                    tc.principal_user_id
+                                    if tc.principal_user_id is not None
+                                    else principal_user_id
+                                ),
+                            )
+                            for tc in tool_calls
+                        ],
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return user_msg_id, assistant_msg_id
 
     # ---- pending attachments ---------------------------------------------
@@ -570,28 +609,29 @@ class SessionStore:
     ) -> int:
         db = self._conn
         now = _now_iso()
-        async with db.execute(
-            """
-            INSERT INTO pending_attachments
-                (chat_id, file_id, file_unique_id, media_group_id, kind, file_name,
-                 mime_type, file_size, caption, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                chat_id,
-                file_id,
-                file_unique_id,
-                media_group_id,
-                kind,
-                file_name,
-                mime_type,
-                file_size,
-                caption,
-                now,
-            ),
-        ) as cur:
-            new_id = cur.lastrowid
-        await db.commit()
+        async with self._write_lock:
+            async with db.execute(
+                """
+                INSERT INTO pending_attachments
+                    (chat_id, file_id, file_unique_id, media_group_id, kind, file_name,
+                     mime_type, file_size, caption, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    chat_id,
+                    file_id,
+                    file_unique_id,
+                    media_group_id,
+                    kind,
+                    file_name,
+                    mime_type,
+                    file_size,
+                    caption,
+                    now,
+                ),
+            ) as cur:
+                new_id = cur.lastrowid
+            await db.commit()
         return new_id
 
     async def latest_pending_attachment(self, chat_id: int) -> PendingAttachment | None:
@@ -656,8 +696,9 @@ class SessionStore:
 
     async def delete_pending_attachment(self, pending_id: int) -> None:
         db = self._conn
-        await db.execute("DELETE FROM pending_attachments WHERE id = ?", (pending_id,))
-        await db.commit()
+        async with self._write_lock:
+            await db.execute("DELETE FROM pending_attachments WHERE id = ?", (pending_id,))
+            await db.commit()
 
     # ---- saved files + embeddings ----------------------------------------
 
@@ -677,28 +718,29 @@ class SessionStore:
         """Insert a `saved_files` row and (if provided) its embedding, atomically."""
         db = self._conn
         now = _now_iso()
-        await db.execute("BEGIN")
-        try:
-            async with db.execute(
-                """
-                INSERT INTO saved_files
+        async with self._write_lock:
+            await db.execute("BEGIN")
+            try:
+                async with db.execute(
+                    """
+                    INSERT INTO saved_files
+                        (chat_id, relpath, kind, file_name, mime_type,
+                         file_size, caption, description, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
                     (chat_id, relpath, kind, file_name, mime_type,
-                     file_size, caption, description, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (chat_id, relpath, kind, file_name, mime_type,
-                 file_size, caption, description, now),
-            ) as cur:
-                saved_id = cur.lastrowid
-            if embedding is not None and self._has_vec:
-                await db.execute(
-                    "INSERT INTO file_embeddings (file_id, embedding) VALUES (?, ?)",
-                    (saved_id, _pack_embedding(embedding)),
-                )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+                     file_size, caption, description, now),
+                ) as cur:
+                    saved_id = cur.lastrowid
+                if embedding is not None and self._has_vec:
+                    await db.execute(
+                        "INSERT INTO file_embeddings (file_id, embedding) VALUES (?, ?)",
+                        (saved_id, _pack_embedding(embedding)),
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
         return saved_id
 
     async def search_files_semantic(
@@ -739,15 +781,16 @@ class SessionStore:
         """Insert a nudge row and return its id. `fire_at_iso_utc` must be UTC ISO 8601."""
         db = self._conn
         now = _now_iso()
-        async with db.execute(
-            """
-            INSERT INTO scheduled_nudges (chat_id, fire_at, message, created_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (chat_id, fire_at_iso_utc, message, now),
-        ) as cur:
-            new_id = cur.lastrowid
-        await db.commit()
+        async with self._write_lock:
+            async with db.execute(
+                """
+                INSERT INTO scheduled_nudges (chat_id, fire_at, message, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (chat_id, fire_at_iso_utc, message, now),
+            ) as cur:
+                new_id = cur.lastrowid
+            await db.commit()
         return new_id
 
     async def list_due_nudges(self, now_iso_utc: str) -> list[ScheduledNudge]:
@@ -782,11 +825,12 @@ class SessionStore:
 
     async def mark_nudge_sent(self, nudge_id: int) -> None:
         db = self._conn
-        await db.execute(
-            "UPDATE scheduled_nudges SET sent_at = ? WHERE id = ? AND sent_at IS NULL",
-            (_now_iso(), nudge_id),
-        )
-        await db.commit()
+        async with self._write_lock:
+            await db.execute(
+                "UPDATE scheduled_nudges SET sent_at = ? WHERE id = ? AND sent_at IS NULL",
+                (_now_iso(), nudge_id),
+            )
+            await db.commit()
 
     # ---- conversation-memory embeddings ----------------------------------
 
@@ -802,11 +846,12 @@ class SessionStore:
         if not self._has_vec:
             return
         try:
-            await self._conn.execute(
-                "INSERT INTO message_embeddings (assistant_message_id, embedding) VALUES (?, ?)",
-                (assistant_message_id, _pack_embedding(embedding)),
-            )
-            await self._conn.commit()
+            async with self._write_lock:
+                await self._conn.execute(
+                    "INSERT INTO message_embeddings (assistant_message_id, embedding) VALUES (?, ?)",
+                    (assistant_message_id, _pack_embedding(embedding)),
+                )
+                await self._conn.commit()
         except Exception:
             logger.exception(
                 "failed to store message embedding for assistant_msg_id=%s",
@@ -887,17 +932,172 @@ class SessionStore:
         Returns True if a row was cancelled, False if none matched or already fired.
         """
         db = self._conn
+        async with self._write_lock:
+            async with db.execute(
+                """
+                UPDATE scheduled_nudges
+                SET cancelled_at = ?
+                WHERE id = ? AND chat_id = ? AND sent_at IS NULL AND cancelled_at IS NULL
+                """,
+                (_now_iso(), nudge_id, chat_id),
+            ) as cur:
+                changed = cur.rowcount or 0
+            await db.commit()
+        return changed > 0
+
+    # ---- api_usage (Phase 2.0 audit) -------------------------------------
+
+    async def record_api_usage(
+        self,
+        *,
+        provider: str,
+        model_or_endpoint: str,
+        chat_id: int | None,
+        skill_id: str | None,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cache_read_tokens: int | None,
+        cache_create_tokens: int | None,
+        units: int | None,
+        cost_usd_micro: int,
+        elapsed_ms: int | None,
+        status: str = "ok",
+    ) -> None:
+        """Append one row to `api_usage`. Called by UsageRecorder; never raises
+        through to the caller — the recorder wraps this in a background task
+        and logs failures separately.
+        """
+        db = self._conn
+        now = _now_iso()
+        async with self._write_lock:
+            await db.execute(
+                """
+                INSERT INTO api_usage
+                    (provider, model_or_endpoint, chat_id, skill_id,
+                     input_tokens, output_tokens, cache_read_tokens, cache_create_tokens,
+                     units, cost_usd_micro, elapsed_ms, status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    provider,
+                    model_or_endpoint,
+                    chat_id,
+                    skill_id,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_create_tokens,
+                    units,
+                    int(cost_usd_micro),
+                    elapsed_ms,
+                    status,
+                    now,
+                ),
+            )
+            await db.commit()
+
+    async def usage_totals_between(
+        self, since_iso_utc: str, until_iso_utc: str
+    ) -> dict[str, Any]:
+        """Aggregate api_usage rows in `[since, until)` into a single summary.
+
+        Returns totals across all providers — `usage_breakdown_between` does
+        the grouped form.
+        """
+        db = self._conn
         async with db.execute(
             """
-            UPDATE scheduled_nudges
-            SET cancelled_at = ?
-            WHERE id = ? AND chat_id = ? AND sent_at IS NULL AND cancelled_at IS NULL
+            SELECT
+                COALESCE(SUM(input_tokens), 0)        AS in_tok,
+                COALESCE(SUM(output_tokens), 0)       AS out_tok,
+                COALESCE(SUM(cache_read_tokens), 0)   AS cache_r,
+                COALESCE(SUM(cache_create_tokens), 0) AS cache_c,
+                COALESCE(SUM(units), 0)               AS units,
+                COALESCE(SUM(cost_usd_micro), 0)      AS cost_micro,
+                COUNT(*)                              AS calls,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+            FROM api_usage
+            WHERE created_at >= ? AND created_at < ?
             """,
-            (_now_iso(), nudge_id, chat_id),
+            (since_iso_utc, until_iso_utc),
         ) as cur:
-            changed = cur.rowcount or 0
-        await db.commit()
-        return changed > 0
+            row = await cur.fetchone()
+        if row is None:
+            return {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_create_tokens": 0,
+                "units": 0,
+                "cost_usd_micro": 0,
+                "calls": 0,
+                "errors": 0,
+            }
+        return {
+            "input_tokens": int(row[0]),
+            "output_tokens": int(row[1]),
+            "cache_read_tokens": int(row[2]),
+            "cache_create_tokens": int(row[3]),
+            "units": int(row[4]),
+            "cost_usd_micro": int(row[5]),
+            "calls": int(row[6]),
+            "errors": int(row[7] or 0),
+        }
+
+    async def usage_breakdown_between(
+        self,
+        since_iso_utc: str,
+        until_iso_utc: str,
+        *,
+        group_by: str = "provider",
+    ) -> list[dict[str, Any]]:
+        """Aggregate api_usage by one of provider / model_or_endpoint / skill_id.
+
+        Returns a list of dict rows ordered by cost_usd_micro descending. The
+        usage skill renders these into a human-readable table.
+        """
+        valid_columns = {"provider", "model_or_endpoint", "skill_id"}
+        if group_by not in valid_columns:
+            raise ValueError(
+                f"group_by must be one of {sorted(valid_columns)}, got {group_by!r}"
+            )
+        db = self._conn
+        # group_by has been validated against an allowlist above — safe to
+        # interpolate into the SQL.
+        sql = f"""
+            SELECT
+                {group_by}                              AS bucket,
+                COALESCE(SUM(input_tokens), 0)         AS in_tok,
+                COALESCE(SUM(output_tokens), 0)        AS out_tok,
+                COALESCE(SUM(cache_read_tokens), 0)    AS cache_r,
+                COALESCE(SUM(cache_create_tokens), 0)  AS cache_c,
+                COALESCE(SUM(units), 0)                AS units,
+                COALESCE(SUM(cost_usd_micro), 0)       AS cost_micro,
+                COUNT(*)                               AS calls,
+                SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors
+            FROM api_usage
+            WHERE created_at >= ? AND created_at < ?
+            GROUP BY {group_by}
+            ORDER BY cost_micro DESC, calls DESC
+        """
+        async with db.execute(sql, (since_iso_utc, until_iso_utc)) as cur:
+            rows = await cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "bucket": row[0] if row[0] is not None else "(none)",
+                    "input_tokens": int(row[1]),
+                    "output_tokens": int(row[2]),
+                    "cache_read_tokens": int(row[3]),
+                    "cache_create_tokens": int(row[4]),
+                    "units": int(row[5]),
+                    "cost_usd_micro": int(row[6]),
+                    "calls": int(row[7]),
+                    "errors": int(row[8] or 0),
+                }
+            )
+        return out
 
     async def get_saved_file_by_relpath(self, relpath: str) -> SavedFile | None:
         db = self._conn

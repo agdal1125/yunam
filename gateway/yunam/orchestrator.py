@@ -25,6 +25,12 @@ from .prompts import SYSTEM_PROMPT
 from .sessions import SessionStore, ToolCall
 from .skills.base import DispatchContext, SkillRegistry
 from .tools.vault import VaultError
+from .usage import (
+    UsageRecorder,
+    reset_skill_context,
+    set_skill_context,
+    set_turn_context,
+)
 
 
 # Substring triggers for the privacy heuristic. Hit on any of these and the
@@ -148,6 +154,7 @@ class Orchestrator:
         thinking: dict[str, Any] | None = None,
         output_config: dict[str, Any] | None = None,
         principals: tuple[Principal, ...] = (),
+        usage_recorder: UsageRecorder | None = None,
     ):
         self._claude = claude_client
         self._store = store
@@ -159,6 +166,7 @@ class Orchestrator:
         self._max_tokens = max_tokens
         self._thinking = thinking
         self._output_config = output_config
+        self._usage = usage_recorder
         # principals — frozen at construction so the rendered `[from: <name>]`
         # markers in history are stable for prompt-cache friendliness. Adding
         # a principal requires a gateway restart, which is the same rule we
@@ -248,6 +256,10 @@ class Orchestrator:
         return {"history": rendered}
 
     async def _agent_step_node(self, state: AgentState) -> dict[str, Any]:
+        # Bind the chat_id for any usage records emitted from this turn — the
+        # ContextVar propagates into every tool handler/embedder call we
+        # subsequently make on this asyncio task.
+        set_turn_context(state["chat_id"])
         messages: list[dict[str, Any]] = list(state["history"])
         # Per-turn context (date, preferences) goes in the user message, never
         # the system prompt — otherwise every edit to a preferences file or
@@ -316,7 +328,23 @@ class Orchestrator:
                 create_kwargs["thinking"] = self._thinking
             if self._output_config is not None:
                 create_kwargs["output_config"] = self._output_config
-            response = await self._claude.messages.create(**create_kwargs)
+            t_claude = time.monotonic()
+            claude_status = "ok"
+            try:
+                response = await self._claude.messages.create(**create_kwargs)
+            except Exception:
+                claude_status = "error"
+                # Best-effort record the failed attempt before re-raising so
+                # spend-on-error is still visible in api_usage. usage is None
+                # in this path; cost_micro stays 0.
+                if self._usage is not None:
+                    self._usage.record_anthropic(
+                        model=self._model,
+                        usage=None,
+                        elapsed_ms=int((time.monotonic() - t_claude) * 1000),
+                        status=claude_status,
+                    )
+                raise
             final_response = response
 
             usage = getattr(response, "usage", None)
@@ -330,6 +358,13 @@ class Orchestrator:
                     getattr(usage, "output_tokens", "?"),
                     getattr(usage, "cache_read_input_tokens", "?"),
                     getattr(usage, "cache_creation_input_tokens", "?"),
+                )
+            if self._usage is not None:
+                self._usage.record_anthropic(
+                    model=self._model,
+                    usage=usage,
+                    elapsed_ms=int((time.monotonic() - t_claude) * 1000),
+                    status=claude_status,
                 )
 
             stop_reason = getattr(response, "stop_reason", None)
@@ -373,10 +408,18 @@ class Orchestrator:
                     skill_id = skill.id
                     scope = str(tool_spec.scope)
                     handler_inputs = inputs if isinstance(inputs, dict) else {}
-                    result = await tool_spec.handler(
-                        handler_inputs,
-                        dispatch_ctx,
-                    )
+                    # Bind the active skill_id for any usage records emitted
+                    # downstream (Voyage embed, Jina fetch, Sweet Tracker, MCP
+                    # tool). Reset on exit so adjacent tool calls in the same
+                    # iteration don't leak each other's skill_id.
+                    skill_token = set_skill_context(skill_id)
+                    try:
+                        result = await tool_spec.handler(
+                            handler_inputs,
+                            dispatch_ctx,
+                        )
+                    finally:
+                        reset_skill_context(skill_token)
                 except VaultError as e:
                     result = f"Tool error: {e}"
                     is_error = True

@@ -18,9 +18,12 @@ error rather than silently failing — user finishes signup and re-deploys.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Final
 
 import httpx
+
+from ..usage import UsageRecorder
 
 ENDPOINT: Final = "https://info.sweettracker.co.kr/api/v1/trackingInfo"
 DEFAULT_TIMEOUT_S: Final = 10.0
@@ -92,9 +95,11 @@ class ParcelTools:
         *,
         api_key: str | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
+        usage_recorder: UsageRecorder | None = None,
     ):
         self._api_key = api_key
         self._timeout_s = timeout_s
+        self._usage = usage_recorder
 
     async def parcel_track(self, carrier: str, tracking_no: str) -> str:
         if not self._api_key:
@@ -108,26 +113,40 @@ class ParcelTools:
 
         carrier_code = _resolve_carrier(carrier)
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(
-                ENDPOINT,
-                params={
-                    "t_key": self._api_key,
-                    "t_code": carrier_code,
-                    "t_invoice": tracking_no,
-                },
-            )
-            if r.status_code != 200:
-                raise ParcelError(
-                    f"Sweet Tracker returned HTTP {r.status_code}: {r.text[:200]}"
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+                r = await client.get(
+                    ENDPOINT,
+                    params={
+                        "t_key": self._api_key,
+                        "t_code": carrier_code,
+                        "t_invoice": tracking_no,
+                    },
                 )
-            data = r.json()
+                if r.status_code != 200:
+                    raise ParcelError(
+                        f"Sweet Tracker returned HTTP {r.status_code}: {r.text[:200]}"
+                    )
+                data = r.json()
 
-        # Sweet Tracker error shape: {"code": "...", "msg": "...", "status": false}
-        if data.get("status") is False or data.get("code"):
-            raise ParcelError(
-                f"Sweet Tracker error: {data.get('msg') or data.get('code') or data}"
-            )
+            # Sweet Tracker error shape: {"code": "...", "msg": "...", "status": false}
+            if data.get("status") is False or data.get("code"):
+                raise ParcelError(
+                    f"Sweet Tracker error: {data.get('msg') or data.get('code') or data}"
+                )
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            if self._usage is not None:
+                self._usage.record_rest(
+                    provider="sweettracker",
+                    endpoint="trackingInfo",
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    status=status,
+                )
 
         return _format_tracking(data, carrier, tracking_no)
 

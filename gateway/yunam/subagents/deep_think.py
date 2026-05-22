@@ -20,6 +20,7 @@ from ..config import Principal
 from ..orchestrator import Orchestrator
 from ..sessions import SessionStore
 from ..skills.base import SkillRegistry
+from ..usage import UsageRecorder
 
 # Keep these narrow — the whole point of /think being opt-in is to make Opus
 # use deliberate. Widening the budget here silently raises cost.
@@ -36,6 +37,7 @@ def build_deep_think_orchestrator(
     vault_path: Path | None = None,
     embedder: Any | None = None,
     principals: tuple[Principal, ...] = (),
+    usage_recorder: UsageRecorder | None = None,
 ) -> Orchestrator:
     """Build a deep-think Orchestrator (Opus 4.7 + adaptive thinking / high effort).
 
@@ -55,4 +57,5 @@ def build_deep_think_orchestrator(
         thinking={"type": "adaptive"},
         output_config={"effort": "high"},
         principals=principals,
+        usage_recorder=usage_recorder,
     )

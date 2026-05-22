@@ -14,9 +14,12 @@ Korean PM grade bands follow the 환경부 standard for user-friendly labeling.
 
 from __future__ import annotations
 
+import time
 from typing import Final
 
 import httpx
+
+from ..usage import UsageRecorder
 
 GEOCODE_ENDPOINT: Final = "https://geocoding-api.open-meteo.com/v1/search"
 AIRQ_ENDPOINT: Final = "https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -134,8 +137,24 @@ def _grade_pm10(v: float) -> str:
 class AirQualityTools:
     """Async air-quality lookups. One instance per process."""
 
-    def __init__(self, timeout_s: float = DEFAULT_TIMEOUT_S):
+    def __init__(
+        self,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+        *,
+        usage_recorder: UsageRecorder | None = None,
+    ):
         self._timeout_s = timeout_s
+        self._usage = usage_recorder
+
+    def _record(self, *, endpoint: str, t0: float, status: str) -> None:
+        if self._usage is None:
+            return
+        self._usage.record_rest(
+            provider="open-meteo",
+            endpoint=endpoint,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            status=status,
+        )
 
     async def airquality_lookup(
         self,
@@ -157,21 +176,29 @@ class AirQualityTools:
             else:
                 lat, lng, resolved_name = await self._geocode(location.strip())
 
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(
-                AIRQ_ENDPOINT,
-                params={
-                    "latitude": lat,
-                    "longitude": lng,
-                    "current": "pm10,pm2_5,european_aqi,us_aqi",
-                    "timezone": "auto",
-                },
-            )
-            if r.status_code != 200:
-                raise AirQualityError(
-                    f"Open-Meteo air-quality returned HTTP {r.status_code}: {r.text[:200]}"
+        t0 = time.monotonic()
+        airq_status = "ok"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+                r = await client.get(
+                    AIRQ_ENDPOINT,
+                    params={
+                        "latitude": lat,
+                        "longitude": lng,
+                        "current": "pm10,pm2_5,european_aqi,us_aqi",
+                        "timezone": "auto",
+                    },
                 )
-            data = r.json()
+                if r.status_code != 200:
+                    raise AirQualityError(
+                        f"Open-Meteo air-quality returned HTTP {r.status_code}: {r.text[:200]}"
+                    )
+                data = r.json()
+        except Exception:
+            airq_status = "error"
+            raise
+        finally:
+            self._record(endpoint="airquality", t0=t0, status=airq_status)
 
         current = data.get("current") or {}
         time_tag = current.get("time", "")
@@ -194,16 +221,24 @@ class AirQualityTools:
         return "\n".join(lines)
 
     async def _geocode(self, location: str) -> tuple[float, float, str]:
-        async with httpx.AsyncClient(timeout=self._timeout_s) as client:
-            r = await client.get(
-                GEOCODE_ENDPOINT,
-                params={"name": location, "count": 1, "language": "ko"},
-            )
-            if r.status_code != 200:
-                raise AirQualityError(
-                    f"Open-Meteo geocoding returned HTTP {r.status_code}: {r.text[:200]}"
+        t0 = time.monotonic()
+        geo_status = "ok"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+                r = await client.get(
+                    GEOCODE_ENDPOINT,
+                    params={"name": location, "count": 1, "language": "ko"},
                 )
-            data = r.json()
+                if r.status_code != 200:
+                    raise AirQualityError(
+                        f"Open-Meteo geocoding returned HTTP {r.status_code}: {r.text[:200]}"
+                    )
+                data = r.json()
+        except Exception:
+            geo_status = "error"
+            raise
+        finally:
+            self._record(endpoint="geocoding", t0=t0, status=geo_status)
         results = data.get("results") or []
         if not results:
             raise AirQualityError(f"location not found: {location!r}")

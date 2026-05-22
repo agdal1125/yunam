@@ -53,6 +53,7 @@ from yunam.skills import (
     build_parcel_skill,
     build_privacy_skill,
     build_reminders_skill,
+    build_usage_skill,
     build_web_skill,
 )
 from yunam.subagents import build_deep_think_orchestrator
@@ -63,7 +64,9 @@ from yunam.tools.obsidian import ObsidianTools
 from yunam.tools.obsidian_graph import ObsidianGraphTools
 from yunam.tools.parcel import ParcelTools
 from yunam.tools.reminders import ReminderTools
+from yunam.tools.usage import UsageTools
 from yunam.tools.web import WebTools
+from yunam.usage import UsageRecorder
 
 load_dotenv()
 configure_logging()
@@ -85,9 +88,16 @@ async def _run() -> None:
     )
 
     store = await SessionStore.open(cfg.db_path)
+    # UsageRecorder is constructed once and threaded through every paid
+    # external call (Anthropic / Voyage / Jina / Sweet Tracker / Open-Meteo /
+    # MCP). Each tool that takes optional `usage_recorder=` will record per
+    # request; missing it (e.g. obsidian filesystem ops) is a no-op.
+    usage_recorder = UsageRecorder(store)
     tools = ObsidianTools(cfg.vault_path)
     claude_client = anthropic.AsyncAnthropic(api_key=cfg.anthropic_api_key)
-    embedder = VoyageEmbedder(api_key=cfg.voyage_api_key)
+    embedder = VoyageEmbedder(
+        api_key=cfg.voyage_api_key, usage_recorder=usage_recorder
+    )
 
     app = Application.builder().token(cfg.telegram_token).build()
     sender = PTBSender(app.bot)
@@ -100,9 +110,13 @@ async def _run() -> None:
         vision_client=claude_client,
         timezone=cfg.timezone,
     )
-    web_tools = WebTools(jina_api_key=cfg.jina_api_key)
-    airquality_tools = AirQualityTools()
-    parcel_tools = ParcelTools(api_key=cfg.sweettracker_api_key)
+    web_tools = WebTools(
+        jina_api_key=cfg.jina_api_key, usage_recorder=usage_recorder
+    )
+    airquality_tools = AirQualityTools(usage_recorder=usage_recorder)
+    parcel_tools = ParcelTools(
+        api_key=cfg.sweettracker_api_key, usage_recorder=usage_recorder
+    )
     reminder_tools = ReminderTools(store=store, timezone_name=cfg.timezone)
     memory_tools = MemoryTools(
         store=store,
@@ -111,6 +125,12 @@ async def _run() -> None:
         principals=cfg.principals,
     )
     graph_tools = ObsidianGraphTools(vault_root=cfg.vault_path)
+    usage_tools = UsageTools(
+        store=store,
+        timezone_name=cfg.timezone,
+        daily_alert_usd=cfg.cost_alert_daily_usd,
+        monthly_alert_usd=cfg.cost_alert_monthly_usd,
+    )
 
     # Optional: connect to MCP sibling containers. If a URL is unset we skip
     # the skill entirely (dev-time or pre-OAuth state). If a URL is set but
@@ -122,7 +142,9 @@ async def _run() -> None:
     if cfg.gcal_mcp_url:
         logger.info("gcal MCP configured at %s — connecting", cfg.gcal_mcp_url)
         try:
-            gcal_client = GCalMCPClient(cfg.gcal_mcp_url)
+            gcal_client = GCalMCPClient(
+                cfg.gcal_mcp_url, usage_recorder=usage_recorder
+            )
             await gcal_client.connect()
             gcal_skill = build_gcal_mcp_skill(gcal_client)
         except Exception:
@@ -141,7 +163,9 @@ async def _run() -> None:
     if cfg.stock_mcp_url:
         logger.info("stock MCP configured at %s — connecting", cfg.stock_mcp_url)
         try:
-            stock_client = StockMCPClient(cfg.stock_mcp_url)
+            stock_client = StockMCPClient(
+                cfg.stock_mcp_url, usage_recorder=usage_recorder
+            )
             await stock_client.connect()
             stock_skill = build_stock_mcp_skill(stock_client)
         except Exception:
@@ -169,10 +193,10 @@ async def _run() -> None:
     skills.append(build_reminders_skill(reminder_tools))
     skills.append(build_memory_skill(memory_tools))
     skills.append(build_obsidian_graph_skill(graph_tools))
-    # Privacy skill is appended last — adding it doesn't reorder any existing
-    # skill (preserves prompt-cache prefix order beyond the one-time bump
-    # from the SYSTEM_PROMPT rewrite for multi-principal awareness).
     skills.append(build_privacy_skill())
+    # Usage skill last — appending after `privacy` preserves the existing
+    # prompt-cache prefix and only adds its own fragment + tools at the tail.
+    skills.append(build_usage_skill(usage_tools))
     registry = SkillRegistry(skills)
     orch = Orchestrator(
         claude_client, store, registry,
@@ -180,6 +204,7 @@ async def _run() -> None:
         vault_path=cfg.vault_path,
         embedder=embedder,
         principals=cfg.principals,
+        usage_recorder=usage_recorder,
     )
     # Deep-think path (Opus 4.7 + adaptive / high effort) — only invoked via
     # the /think command, never by the main agent autonomously.
@@ -189,6 +214,7 @@ async def _run() -> None:
         vault_path=cfg.vault_path,
         embedder=embedder,
         principals=cfg.principals,
+        usage_recorder=usage_recorder,
     )
 
     app.bot_data["cfg"] = cfg
@@ -291,6 +317,9 @@ async def _run() -> None:
             await gcal_client.close()
         if stock_client is not None:
             await stock_client.close()
+        # Drain in-flight api_usage writes before closing the DB so a fast
+        # shutdown doesn't lose the last turn's bookkeeping.
+        await usage_recorder.flush()
         await store.close()
         logger.info("gateway stopped cleanly")
 

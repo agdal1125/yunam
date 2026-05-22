@@ -24,6 +24,7 @@ them as clean tool errors to Claude (rather than 500-ing the turn).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from mcp import ClientSession
@@ -33,6 +34,7 @@ from mcp.shared.exceptions import McpError
 from ..capabilities import Scope
 from ..skills.base import DispatchContext, Skill, ToolSpec
 from ..tools.vault import VaultError
+from ..usage import UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +66,12 @@ class StockMCPClient:
       4. `await close()` at shutdown
     """
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, *, usage_recorder: UsageRecorder | None = None):
         self._url = url
         self._sse_ctx: Any = None
         self._session: ClientSession | None = None
         self._tools: tuple[dict[str, Any], ...] = ()
+        self._usage = usage_recorder
 
     async def connect(self) -> None:
         if self._session is not None:
@@ -127,14 +130,39 @@ class StockMCPClient:
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         if self._session is None:
             raise VaultError("stock MCP client is not connected")
+        t0 = time.monotonic()
+        call_status = "ok"
         try:
             result = await self._session.call_tool(name, arguments=arguments)
         except McpError as e:
+            call_status = "error"
             logger.info("stock call_tool %s mcp-error: %s", name, e)
+            if self._usage is not None:
+                self._usage.record_mcp(
+                    server="stock",
+                    tool_name=name,
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    status=call_status,
+                )
             raise VaultError(f"stock MCP error ({name}): {e}") from e
         except Exception as e:
+            call_status = "error"
             logger.info("stock call_tool %s exception: %r", name, e)
+            if self._usage is not None:
+                self._usage.record_mcp(
+                    server="stock",
+                    tool_name=name,
+                    elapsed_ms=int((time.monotonic() - t0) * 1000),
+                    status=call_status,
+                )
             raise VaultError(f"stock MCP error ({name}): {e}") from e
+        if self._usage is not None:
+            self._usage.record_mcp(
+                server="stock",
+                tool_name=name,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                status=call_status,
+            )
 
         # `result.content` is a list of content blocks (text / image / resource).
         # We collapse to a single string for the tool_result block.

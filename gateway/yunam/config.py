@@ -48,6 +48,8 @@ class Config:
     sweettracker_api_key: str | None
     gcal_mcp_url: str | None
     stock_mcp_url: str | None
+    cost_alert_daily_usd: float
+    cost_alert_monthly_usd: float
 
     @property
     def principals_by_id(self) -> dict[int, Principal]:
@@ -222,6 +224,12 @@ def load_config() -> Config:
         sweettracker_api_key=sweettracker_api_key_raw or None,
         gcal_mcp_url=gcal_mcp_url_raw or None,
         stock_mcp_url=stock_mcp_url_raw or None,
+        cost_alert_daily_usd=float(
+            os.environ.get("YUNAM_COST_ALERT_DAILY_USD", "5.0")
+        ),
+        cost_alert_monthly_usd=float(
+            os.environ.get("YUNAM_COST_ALERT_MONTHLY_USD", "100.0")
+        ),
     )
 
 

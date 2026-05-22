@@ -17,10 +17,13 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Final
 from urllib.parse import quote_plus, unquote_plus, urlparse
 
 import httpx
+
+from ..usage import UsageRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +80,29 @@ class WebTools:
         jina_api_key: str | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         max_bytes: int = MAX_BYTES,
+        usage_recorder: UsageRecorder | None = None,
     ):
         self._jina_api_key = jina_api_key
         self._timeout_s = timeout_s
         self._max_bytes = max_bytes
+        self._usage = usage_recorder
+
+    def _record(
+        self,
+        *,
+        provider: str,
+        endpoint: str,
+        t0: float,
+        status: str,
+    ) -> None:
+        if self._usage is None:
+            return
+        self._usage.record_rest(
+            provider=provider,
+            endpoint=endpoint,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            status=status,
+        )
 
     def _jina_headers(self) -> dict[str, str]:
         headers = {"Accept": "text/plain"}
@@ -113,41 +135,73 @@ class WebTools:
 
     async def _jina_fetch(self, url: str) -> str:
         endpoint = f"https://r.jina.ai/{url}"
-        async with httpx.AsyncClient(timeout=self._timeout_s, follow_redirects=True) as client:
-            r = await client.get(endpoint, headers=self._jina_headers())
-            r.raise_for_status()
-            return _truncate(r.text, self._max_bytes)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s, follow_redirects=True) as client:
+                r = await client.get(endpoint, headers=self._jina_headers())
+                r.raise_for_status()
+                return _truncate(r.text, self._max_bytes)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self._record(provider="jina", endpoint="reader", t0=t0, status=status)
 
     async def _direct_fetch(self, url: str) -> str:
-        async with httpx.AsyncClient(
-            timeout=self._timeout_s,
-            follow_redirects=True,
-            headers={"User-Agent": _UA},
-        ) as client:
-            r = await client.get(url)
-            r.raise_for_status()
-            content_type = r.headers.get("content-type", "").lower()
-            if not any(t in content_type for t in ("text/", "json", "xml", "html")):
-                raise WebError(f"non-text content-type: {content_type!r}")
-            return _truncate(r.text, self._max_bytes)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_s,
+                follow_redirects=True,
+                headers={"User-Agent": _UA},
+            ) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                content_type = r.headers.get("content-type", "").lower()
+                if not any(t in content_type for t in ("text/", "json", "xml", "html")):
+                    raise WebError(f"non-text content-type: {content_type!r}")
+                return _truncate(r.text, self._max_bytes)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self._record(provider="direct", endpoint="fetch", t0=t0, status=status)
 
     async def _jina_search(self, query: str) -> str:
         endpoint = f"https://s.jina.ai/?q={quote_plus(query)}"
-        async with httpx.AsyncClient(timeout=self._timeout_s, follow_redirects=True) as client:
-            r = await client.get(endpoint, headers=self._jina_headers())
-            r.raise_for_status()
-            return _truncate(r.text, self._max_bytes)
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s, follow_redirects=True) as client:
+                r = await client.get(endpoint, headers=self._jina_headers())
+                r.raise_for_status()
+                return _truncate(r.text, self._max_bytes)
+        except Exception:
+            status = "error"
+            raise
+        finally:
+            self._record(provider="jina", endpoint="search", t0=t0, status=status)
 
     async def _ddg_search(self, query: str, num: int) -> str:
         endpoint = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
-        async with httpx.AsyncClient(
-            timeout=self._timeout_s,
-            follow_redirects=True,
-            headers={"User-Agent": _UA},
-        ) as client:
-            r = await client.get(endpoint)
-            r.raise_for_status()
-            html = r.text
+        t0 = time.monotonic()
+        status = "ok"
+        try:
+            async with httpx.AsyncClient(
+                timeout=self._timeout_s,
+                follow_redirects=True,
+                headers={"User-Agent": _UA},
+            ) as client:
+                r = await client.get(endpoint)
+                r.raise_for_status()
+                html = r.text
+        except Exception:
+            status = "error"
+            self._record(provider="duckduckgo", endpoint="html", t0=t0, status=status)
+            raise
+        self._record(provider="duckduckgo", endpoint="html", t0=t0, status=status)
 
         link_pattern = re.compile(
             r'<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.+?)</a>',

@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
+from typing import Any
+
+from .usage import UsageRecorder
 
 # PIL is imported lazily inside `_build_multimodal_input` so the module can be
 # inspected in environments (CI, local sanity checks) that don't have Pillow
@@ -56,11 +60,47 @@ class EmbeddingError(Exception):
 class VoyageEmbedder:
     """Async wrapper around `voyageai.AsyncClient` with per-file-type prep."""
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, *, usage_recorder: UsageRecorder | None = None):
         # Import lazily so unit tests and the REPL don't require voyageai to be installed.
         import voyageai
 
         self._client = voyageai.AsyncClient(api_key=api_key)
+        self._usage = usage_recorder
+
+    def _record(
+        self,
+        *,
+        result: Any,
+        images: int,
+        elapsed_ms: int,
+        status: str,
+    ) -> None:
+        if self._usage is None:
+            return
+        # voyageai's result object exposes `total_tokens` on a `.usage` attr
+        # for text models; multimodal results expose `.text_tokens` /
+        # `.image_pixels`. Tolerate either shape — missing → 0.
+        token_count = 0
+        usage_obj = getattr(result, "usage", None)
+        if usage_obj is not None:
+            token_count = (
+                getattr(usage_obj, "total_tokens", None)
+                or getattr(usage_obj, "text_tokens", None)
+                or 0
+            )
+        else:
+            token_count = (
+                getattr(result, "total_tokens", None)
+                or getattr(result, "text_tokens", None)
+                or 0
+            )
+        self._usage.record_voyage(
+            model=EMBED_MODEL,
+            text_tokens=int(token_count or 0),
+            images=images,
+            elapsed_ms=elapsed_ms,
+            status=status,
+        )
 
     async def embed_document(
         self,
@@ -81,7 +121,11 @@ class VoyageEmbedder:
         inputs = await asyncio.to_thread(
             _build_multimodal_input, file_path, kind, mime_type, text_parts
         )
+        image_count = sum(
+            1 for item in inputs if not isinstance(item, (str, bytes))
+        )
 
+        t0 = time.monotonic()
         try:
             result = await self._client.multimodal_embed(
                 inputs=[inputs],
@@ -89,14 +133,27 @@ class VoyageEmbedder:
                 input_type="document",
             )
         except Exception as e:
+            self._record(
+                result=None,
+                images=image_count,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                status="error",
+            )
             raise EmbeddingError(f"voyage embed failed: {e}") from e
 
+        self._record(
+            result=result,
+            images=image_count,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            status="ok",
+        )
         vectors = getattr(result, "embeddings", None)
         if not vectors:
             raise EmbeddingError("voyage returned no embeddings")
         return list(vectors[0])
 
     async def embed_query(self, text: str) -> list[float]:
+        t0 = time.monotonic()
         try:
             result = await self._client.multimodal_embed(
                 inputs=[[text]],
@@ -104,7 +161,19 @@ class VoyageEmbedder:
                 input_type="query",
             )
         except Exception as e:
+            self._record(
+                result=None,
+                images=0,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                status="error",
+            )
             raise EmbeddingError(f"voyage query embed failed: {e}") from e
+        self._record(
+            result=result,
+            images=0,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            status="ok",
+        )
         vectors = getattr(result, "embeddings", None)
         if not vectors:
             raise EmbeddingError("voyage returned no embeddings")
@@ -116,6 +185,7 @@ class VoyageEmbedder:
         Symmetric partner to `embed_query`. Use this for conversation turns,
         vault notes, or any text we're storing in a vec0 table for later KNN.
         """
+        t0 = time.monotonic()
         try:
             result = await self._client.multimodal_embed(
                 inputs=[[text]],
@@ -123,7 +193,19 @@ class VoyageEmbedder:
                 input_type="document",
             )
         except Exception as e:
+            self._record(
+                result=None,
+                images=0,
+                elapsed_ms=int((time.monotonic() - t0) * 1000),
+                status="error",
+            )
             raise EmbeddingError(f"voyage text-document embed failed: {e}") from e
+        self._record(
+            result=result,
+            images=0,
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+            status="ok",
+        )
         vectors = getattr(result, "embeddings", None)
         if not vectors:
             raise EmbeddingError("voyage returned no embeddings")
