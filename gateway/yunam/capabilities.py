@@ -32,10 +32,7 @@ class Scope(str, Enum):
     MEMORY_READ = "memory:read"
     VAULT_GRAPH = "vault:graph"
     PRIVACY_WRITE = "privacy:write"
-<<<<<<< HEAD
-=======
     STOCK_SUPPLY_READ = "stock:supply_read"
->>>>>>> c68d3c9 (Seychelles commit job)
 
     def __str__(self) -> str:
         return self.value

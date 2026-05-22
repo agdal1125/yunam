@@ -36,17 +36,12 @@ from yunam.scheduler import (
 )
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
-<<<<<<< HEAD
-from yunam.mcp import GCalMCPClient, build_gcal_mcp_skill
-from yunam.mcp.stock import StockMCPClient, StockSkill
-=======
 from yunam.mcp import (
     GCalMCPClient,
     StockMCPClient,
     build_gcal_mcp_skill,
     build_stock_mcp_skill,
 )
->>>>>>> c68d3c9 (Seychelles commit job)
 from yunam.skills import (
     Skill,
     SkillRegistry,
@@ -117,27 +112,15 @@ async def _run() -> None:
     )
     graph_tools = ObsidianGraphTools(vault_root=cfg.vault_path)
 
-<<<<<<< HEAD
-    # Optional: connect to the Google Calendar MCP sibling container. If the
-    # URL is unset we skip the skill entirely (dev-time or pre-OAuth state).
-    # If the URL is set but unreachable, fail fast — silent skipping there
-    # would hide a misconfiguration.
-=======
     # Optional: connect to MCP sibling containers. If a URL is unset we skip
     # the skill entirely (dev-time or pre-OAuth state). If a URL is set but
     # the container is unreachable / broken, we log loudly and skip the skill
     # rather than crash the gateway — keeping Yunam usable on the rest of its
     # surface is more valuable than fail-fast for an optional integration.
->>>>>>> c68d3c9 (Seychelles commit job)
     gcal_client: GCalMCPClient | None = None
     gcal_skill: Skill | None = None
     if cfg.gcal_mcp_url:
         logger.info("gcal MCP configured at %s — connecting", cfg.gcal_mcp_url)
-<<<<<<< HEAD
-        gcal_client = GCalMCPClient(cfg.gcal_mcp_url)
-        await gcal_client.connect()
-        gcal_skill = build_gcal_mcp_skill(gcal_client)
-=======
         try:
             gcal_client = GCalMCPClient(cfg.gcal_mcp_url)
             await gcal_client.connect()
@@ -150,7 +133,6 @@ async def _run() -> None:
             )
             gcal_client = None
             gcal_skill = None
->>>>>>> c68d3c9 (Seychelles commit job)
     else:
         logger.info("YUNAM_GCAL_MCP_URL unset — gcal skill disabled")
 
@@ -158,11 +140,6 @@ async def _run() -> None:
     stock_skill: Skill | None = None
     if cfg.stock_mcp_url:
         logger.info("stock MCP configured at %s — connecting", cfg.stock_mcp_url)
-<<<<<<< HEAD
-        stock_client = StockMCPClient(cfg.stock_mcp_url)
-        await stock_client.connect()
-        stock_skill = StockSkill(stock_client)
-=======
         try:
             stock_client = StockMCPClient(cfg.stock_mcp_url)
             await stock_client.connect()
@@ -171,7 +148,6 @@ async def _run() -> None:
             logger.exception("stock MCP connect failed — skill disabled for this run")
             stock_client = None
             stock_skill = None
->>>>>>> c68d3c9 (Seychelles commit job)
     else:
         logger.info("YUNAM_STOCK_MCP_URL unset — stock skill disabled")
 
