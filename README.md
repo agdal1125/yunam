@@ -243,6 +243,22 @@ ls -la ~/obsidian/ ~/filevault/
   - [ ] Finance Agent (MoneyFlow MCP integration)
   - [ ] Evals and automated testing
 
+## Pending — Stock Agent MCP wiring
+
+In-flight integration with [`stock-agent`](../stock-agent) (institutional/pension supply analysis). Resume from here after the running backfill finishes (`docker exec yunam-stock-mcp tail -f /app/data/backfill.log`):
+
+- [x] Add `supply_history` table to `canonical.db` (schema was missing; entrypoint skips bootstrap when DB exists)
+- [x] Add `YUNAM_STOCK_MCP_URL=http://stock-mcp:3001/sse` to `.env`
+- [x] Override stock-mcp healthcheck in `docker-compose.yml` (Dockerfile probes :8001 HTTP but mcp_run.py serves SSE on :3001)
+- [x] Patch `../stock-agent/src/stock_agent/agent_int/mcp_run.py` to allowlist `stock-mcp` host in FastMCP `TransportSecuritySettings` (otherwise HTTP 421 "Invalid Host header" from DNS-rebinding protection)
+- [ ] Run the 7-day backfill (`docker exec -d yunam-stock-mcp python /app/backfill.py --days 7`) — **in progress as of 2026-05-12**
+- [ ] After backfill: `docker compose up -d --no-deps --build --force-recreate stock-mcp` to apply the host-allowlist fix
+- [ ] Restart calendar-mcp before each gateway restart (`docker restart yunam-calendar-mcp`) — nspady's stateful MCP is single-session per server, so a leftover session blocks new `initialize` with "Server already initialized"
+- [ ] `docker compose up -d --no-deps --force-recreate gateway` to pick up new `.env` and reconnect to both MCPs
+- [ ] Verify: `docker logs yunam-gateway | grep -E "(gcal|stock) MCP connected"` shows both, and Telegram answers "어제 수급 좋았던 종목" via `get_historical_supply`/`analyze_supply` instead of falling back to web search
+- [ ] Verify `supply_history` populated: 14 rows expected (7 dates × {KOSDAQ, KOSPI})
+- [ ] Commit stock-agent uncommitted files: `backfill.py`, `src/stock_agent/supply/`, `src/stock_agent/agent_int/mcp_run.py`, `src/stock_agent/agent_int/mcp_server.py`, and schema/env diffs
+
 ## Security notes
 
 - `.env` is gitignored. Never commit real tokens or API keys.
