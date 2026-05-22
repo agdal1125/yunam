@@ -217,7 +217,10 @@ sqlite3 data/yunam/yunam.db 'PRAGMA user_version;'
 sqlite3 data/yunam/yunam.db 'SELECT relpath, kind, mime_type, file_size FROM saved_files ORDER BY id DESC LIMIT 10;'
 
 # Pending reminders:
-sqlite3 data/yunam/yunam.db 'SELECT id, chat_id, fire_at, substr(message,1,60) FROM nudges WHERE sent_at IS NULL;'
+sqlite3 data/yunam/yunam.db 'SELECT id, chat_id, fire_at, substr(message,1,60) FROM scheduled_nudges WHERE sent_at IS NULL AND cancelled_at IS NULL;'
+
+# Which MCP skills loaded successfully this run:
+docker logs yunam-gateway 2>&1 | grep -E "(gcal|stock) MCP (connected|configured|disabled|connect failed)"
 
 # See what Yunam has saved to the vault:
 ls -la ~/obsidian/ ~/filevault/
@@ -227,37 +230,38 @@ ls -la ~/obsidian/ ~/filevault/
 
 - **Phase 1** — Agent core with Claude + Obsidian. **Done.**
 - **Phase 1.5** — Binary attachments + Voyage multimodal embeddings + daily retrospective + skill/scope governance layer. **Done.**
-- **Phase 2** — Extended skills + integrations. **In progress.**
+- **Phase 2** — Extended skills + integrations. **Done — see Phase 2.x for what's next.**
   - [x] Web browsing (Jina Reader + DuckDuckGo)
   - [x] Korean skills bundle (air quality, parcel tracking)
   - [x] Reminders / nudge sweeper
   - [x] Long-term memory with semantic recall
   - [x] Multi-principal support (jaekeun + yoolim)
   - [x] Group-chat support (mention/trigger-word gating)
-  - [x] Obsidian graph analysis (backlinks, orphans)
+  - [x] Obsidian graph analysis (backlinks, outgoing links, find-by-tag, graph queries)
   - [x] Deep-think path (`/think` → Opus 4.7)
-  - [x] Google Calendar MCP integration
+  - [x] Google Calendar MCP integration (with auto-recovery from nspady "Server already initialized")
+  - [x] Stock-Agent MCP integration (institutional supply/demand analysis)
   - [x] Manual diary command (`/diary`)
   - [x] Per-turn preference injection (context primer)
   - [x] Handler modularization (handlers/ package)
-  - [ ] Finance Agent (MoneyFlow MCP integration)
-  - [ ] Evals and automated testing
+- **Phase 2.x** — see [milestone.md](milestone.md) for the detailed execution plan.
+  - [ ] Phase 2.0 — API/Cost usage tracking skill (selected first to make the rest measurable)
+  - [ ] Phase 2.1 — Curation pipeline (Naver + Toss Invest + RSS, hourly tick, urgent push / 21:00 newsletter routing)
+  - [ ] Phase 2.2 — Reflection / digital-twin memory (draft-then-approve, no auto-apply to `profile/*.md`)
+  - [ ] Phase 2.3 — Finance guardrail sub-agent wrapping Stock-Agent + a mistake-ledger skill
+  - [ ] Phase 2.4 — Hardening / eval / DB backup cron / docs sync
 
-## Pending — Stock Agent MCP wiring
+## Troubleshooting
 
-In-flight integration with [`stock-agent`](../stock-agent) (institutional/pension supply analysis). Resume from here after the running backfill finishes (`docker exec yunam-stock-mcp tail -f /app/data/backfill.log`):
+**Gateway crashed with `Scope object has no attribute KNOWLEDGE` / `StockSkill object has no attribute tools`** — historical bug from when the stock MCP adapter still followed the older class-based `Skill` interface. Fixed 2026-05-22 by rewriting `mcp/stock.py` to the `build_stock_mcp_skill` factory pattern and adding `Scope.STOCK_SUPPLY_READ` to the enum. If you see these now, you're on an old commit — `git pull && docker compose up -d --build`.
 
-- [x] Add `supply_history` table to `canonical.db` (schema was missing; entrypoint skips bootstrap when DB exists)
-- [x] Add `YUNAM_STOCK_MCP_URL=http://stock-mcp:3001/sse` to `.env`
-- [x] Override stock-mcp healthcheck in `docker-compose.yml` (Dockerfile probes :8001 HTTP but mcp_run.py serves SSE on :3001)
-- [x] Patch `../stock-agent/src/stock_agent/agent_int/mcp_run.py` to allowlist `stock-mcp` host in FastMCP `TransportSecuritySettings` (otherwise HTTP 421 "Invalid Host header" from DNS-rebinding protection)
-- [ ] Run the 7-day backfill (`docker exec -d yunam-stock-mcp python /app/backfill.py --days 7`) — **in progress as of 2026-05-12**
-- [ ] After backfill: `docker compose up -d --no-deps --build --force-recreate stock-mcp` to apply the host-allowlist fix
-- [ ] Restart calendar-mcp before each gateway restart (`docker restart yunam-calendar-mcp`) — nspady's stateful MCP is single-session per server, so a leftover session blocks new `initialize` with "Server already initialized"
-- [ ] `docker compose up -d --no-deps --force-recreate gateway` to pick up new `.env` and reconnect to both MCPs
-- [ ] Verify: `docker logs yunam-gateway | grep -E "(gcal|stock) MCP connected"` shows both, and Telegram answers "어제 수급 좋았던 종목" via `get_historical_supply`/`analyze_supply` instead of falling back to web search
-- [ ] Verify `supply_history` populated: 14 rows expected (7 dates × {KOSDAQ, KOSPI})
-- [ ] Commit stock-agent uncommitted files: `backfill.py`, `src/stock_agent/supply/`, `src/stock_agent/agent_int/mcp_run.py`, `src/stock_agent/agent_int/mcp_server.py`, and schema/env diffs
+**Calendar MCP fails with `MCP HTTP 400 on initialize: Server already initialized`** — nspady google-calendar-mcp keeps a single in-memory session and refuses to re-initialize while one is open. As of 2026-05-22 the gateway recognizes this response and proceeds without re-handshaking, so a gateway restart no longer requires touching the calendar container. If the recovery path itself fails (e.g. nspady changes the error wording), the manual workaround is `docker restart yunam-calendar-mcp` *before* the gateway restart.
+
+**A specific MCP skill isn't being used** — MCP `connect()` failures are no longer fatal; the gateway logs the failure and skips that skill for the run rather than crashing. Check which skills loaded with `docker logs yunam-gateway 2>&1 | grep "MCP connected"`. To re-attempt, fix the upstream issue (OAuth, container down, host header) and restart the gateway.
+
+**Two messages, one reply** — long-poll race between local and VPS containers. Stop one (`docker compose stop` locally, or `docker compose stop` on the VPS) before bringing the other up.
+
+**`vault_write` returns "Permission denied"** — `PUID`/`PGID` in `.env` don't match the host user that owns `~/obsidian`. Fix the env vars (`PUID=$(id -u)`, `PGID=$(id -g)`) and restart; don't `chown` the vault directly, that triggers a full Obsidian Sync re-upload.
 
 ## Security notes
 
