@@ -6,6 +6,7 @@ skills. Don't reach into `base` or the per-skill modules from outside tests.
 
 from .airquality import build_airquality_skill
 from .base import DispatchContext, Skill, SkillRegistry, ToolHandler, ToolSpec
+from .curation import build_curation_skill
 from .files import build_files_skill
 from .memory import build_memory_skill
 from .obsidian import build_obsidian_skill
@@ -23,6 +24,7 @@ __all__ = [
     "ToolHandler",
     "ToolSpec",
     "build_airquality_skill",
+    "build_curation_skill",
     "build_files_skill",
     "build_memory_skill",
     "build_obsidian_skill",

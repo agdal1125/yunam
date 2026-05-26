@@ -42,6 +42,27 @@ SKILL_ID = "stock"
 SKILL_VERSION = "2"
 
 
+def _is_dead_session_error(exc: BaseException) -> bool:
+    """True if `exc` looks like 'SSE stream closed, session unusable'.
+
+    FastMCP+SSE drops the stream when a sync tool (analyze_supply does
+    blocking KRX HTTP calls with sleep) starves the event loop. The first
+    failing call surfaces RemoteProtocolError / McpError("Connection
+    closed"); every subsequent call hits ClosedResourceError because
+    anyio's memory channels are already torn down. Match both signatures
+    so the reconnect path catches the whole family.
+    """
+    name = type(exc).__name__
+    if name in {"ClosedResourceError", "BrokenResourceError", "WouldBlock"}:
+        return True
+    msg = str(exc).lower()
+    return (
+        "connection closed" in msg
+        or "peer closed connection" in msg
+        or "remoteprotocolerror" in msg
+    )
+
+
 SYSTEM_PROMPT_FRAGMENT = """\
 ## Stock Agent (수급 분석)
 
@@ -133,7 +154,25 @@ class StockMCPClient:
         t0 = time.monotonic()
         call_status = "ok"
         try:
-            result = await self._session.call_tool(name, arguments=arguments)
+            try:
+                result = await self._session.call_tool(name, arguments=arguments)
+            except (McpError, Exception) as e:
+                # FastMCP SSE drops the stream when analyze_supply blocks the
+                # event loop too long; the mcp.ClientSession does NOT auto-
+                # reconnect, so every subsequent call_tool raises
+                # ClosedResourceError / McpError("Connection closed"). Detect
+                # the dead-session signature, rebuild the SSE + ClientSession
+                # once, and retry. Anything else is surfaced as-is.
+                if _is_dead_session_error(e):
+                    logger.warning(
+                        "stock MCP session looks dead (%s); reconnecting once and retrying %s",
+                        type(e).__name__, name,
+                    )
+                    await self.close()
+                    await self.connect()
+                    result = await self._session.call_tool(name, arguments=arguments)
+                else:
+                    raise
         except McpError as e:
             call_status = "error"
             logger.info("stock call_tool %s mcp-error: %s", name, e)

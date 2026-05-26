@@ -34,6 +34,9 @@ class Scope(str, Enum):
     PRIVACY_WRITE = "privacy:write"
     STOCK_SUPPLY_READ = "stock:supply_read"
     USAGE_READ = "usage:read"
+    CURATION_FETCH = "curation:fetch"
+    CURATION_RANK = "curation:rank"
+    CURATION_READ = "curation:read"
 
     def __str__(self) -> str:
         return self.value

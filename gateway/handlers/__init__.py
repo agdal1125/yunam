@@ -15,7 +15,15 @@ from telegram.ext import (
 )
 
 from .attachments import on_attachment
-from .commands import on_chatid, on_diary, on_save, on_think, start
+from .commands import (
+    on_chatid,
+    on_diary,
+    on_help,
+    on_newsletter,
+    on_save,
+    on_think,
+    start,
+)
 from .text import on_text
 
 
@@ -23,10 +31,12 @@ def register_handlers(app: Application) -> None:
     """Register all Telegram handlers in deterministic order."""
     # Command handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", on_help))
     app.add_handler(CommandHandler("save", on_save))
     app.add_handler(CommandHandler("think", on_think))
     app.add_handler(CommandHandler("chatid", on_chatid))
     app.add_handler(CommandHandler("diary", on_diary))
+    app.add_handler(CommandHandler("newsletter", on_newsletter))
     # Attachment handler — matches any file-bearing message type.
     attachment_filter = (
         filters.PHOTO

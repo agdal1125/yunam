@@ -24,7 +24,12 @@ services:
         condition: service_healthy
         required: false  # gcal is optional — gateway starts even if MCP is disabled
       stock-mcp:
-        condition: service_started
+        # Was service_started — the gateway raced past stock-mcp's
+        # "Application startup complete" and hit ConnectError on the SSE
+        # endpoint. stock-mcp already has a healthcheck targeting /sse, so
+        # gating on service_healthy gives the gateway a clean connection
+        # window on every restart.
+        condition: service_healthy
         required: false
 
   # Stock Agent MCP server (Local API wrapper for supply/demand data)

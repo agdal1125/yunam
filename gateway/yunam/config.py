@@ -50,6 +50,26 @@ class Config:
     stock_mcp_url: str | None
     cost_alert_daily_usd: float
     cost_alert_monthly_usd: float
+    # --- curation pipeline (Phase 2.1) ---
+    curation_enabled: bool
+    curation_interval_minutes: int
+    curation_urgent_threshold: float
+    curation_digest_threshold: float
+    curation_newsletter_time: str   # "HH:MM" in local tz
+    curation_rss_feeds: tuple[str, ...]            # legacy single-tier (= tier_high if tiers unset)
+    curation_rss_tier_high: tuple[str, ...]        # divisor=1, every tick
+    curation_rss_tier_mid: tuple[str, ...]         # divisor=2, every 2nd tick
+    curation_rss_tier_low: tuple[str, ...]         # divisor=4, every 4th tick
+    naver_client_id: str | None
+    naver_client_secret: str | None
+    naver_queries: tuple[str, ...]
+    toss_fetch_mode: str            # "api" | "playwright" | "disabled"
+    toss_news_url: str
+    x_enabled: bool
+    x_handles: tuple[str, ...]
+    moneyflow_enabled: bool
+    curation_summary_max_chars: int
+    text_embedder_provider: str   # "voyage" (default) | "jina"
 
     @property
     def principals_by_id(self) -> dict[int, Principal]:
@@ -67,6 +87,13 @@ class Config:
 
 def _parse_bool(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _split_csv(value: str) -> tuple[str, ...]:
+    """Comma-separated env values → tuple of trimmed non-empty entries."""
+    if not value:
+        return ()
+    return tuple(s.strip() for s in value.split(",") if s.strip())
 
 
 def _load_principals() -> tuple[Principal, ...]:
@@ -230,6 +257,56 @@ def load_config() -> Config:
         cost_alert_monthly_usd=float(
             os.environ.get("YUNAM_COST_ALERT_MONTHLY_USD", "100.0")
         ),
+        curation_enabled=_parse_bool(
+            os.environ.get("YUNAM_CURATION_ENABLED", "false")
+        ),
+        curation_interval_minutes=int(
+            os.environ.get("YUNAM_CURATION_INTERVAL_MINUTES", "60")
+        ),
+        curation_urgent_threshold=float(
+            os.environ.get("YUNAM_CURATION_URGENT_THRESHOLD", "0.82")
+        ),
+        curation_digest_threshold=float(
+            os.environ.get("YUNAM_CURATION_DIGEST_THRESHOLD", "0.55")
+        ),
+        curation_newsletter_time=os.environ.get(
+            "YUNAM_CURATION_NEWSLETTER_TIME", "21:00"
+        ).strip(),
+        curation_rss_feeds=_split_csv(
+            os.environ.get("YUNAM_CURATION_RSS_FEEDS", "")
+        ),
+        curation_rss_tier_high=_split_csv(
+            os.environ.get("YUNAM_CURATION_RSS_TIER_HIGH", "")
+        ),
+        curation_rss_tier_mid=_split_csv(
+            os.environ.get("YUNAM_CURATION_RSS_TIER_MID", "")
+        ),
+        curation_rss_tier_low=_split_csv(
+            os.environ.get("YUNAM_CURATION_RSS_TIER_LOW", "")
+        ),
+        naver_client_id=os.environ.get("NAVER_CLIENT_ID", "").strip() or None,
+        naver_client_secret=os.environ.get("NAVER_CLIENT_SECRET", "").strip() or None,
+        naver_queries=_split_csv(
+            os.environ.get("YUNAM_CURATION_NAVER_QUERIES", "")
+        ),
+        toss_fetch_mode=os.environ.get(
+            "YUNAM_TOSS_FETCH_MODE", "api"
+        ).strip().lower(),
+        toss_news_url=os.environ.get(
+            "YUNAM_TOSS_NEWS_URL",
+            "https://wts-info-api.tossinvest.com/api/v2/feed/news",
+        ).strip(),
+        x_enabled=_parse_bool(os.environ.get("YUNAM_X_ENABLED", "false")),
+        x_handles=_split_csv(os.environ.get("YUNAM_X_HANDLES", "")),
+        moneyflow_enabled=_parse_bool(
+            os.environ.get("YUNAM_CURATION_MONEYFLOW", "true")
+        ),
+        curation_summary_max_chars=int(
+            os.environ.get("YUNAM_CURATION_SUMMARY_MAX_CHARS", "320")
+        ),
+        text_embedder_provider=os.environ.get(
+            "YUNAM_TEXT_EMBEDDER", "voyage"
+        ).strip().lower(),
     )
 
 

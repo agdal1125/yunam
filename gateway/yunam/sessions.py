@@ -161,6 +161,32 @@ CREATE INDEX IF NOT EXISTS idx_api_usage_created
     ON api_usage(created_at);
 CREATE INDEX IF NOT EXISTS idx_api_usage_provider_created
     ON api_usage(provider, created_at);
+
+-- Phase 2.1 — curation pipeline.
+-- `curated_items` is the stream of fetched-and-scored articles. Source +
+-- external_id is the dedup key (UNIQUE) so re-fetching the same URL from the
+-- same source is a no-op INSERT. `routed_as` is decided once at routing time
+-- and never re-evaluated; `pushed_at`/`digested_at` are the audit timestamps.
+CREATE TABLE IF NOT EXISTS curated_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    source           TEXT NOT NULL,
+    external_id      TEXT NOT NULL,
+    url              TEXT NOT NULL,
+    title            TEXT NOT NULL,
+    raw_excerpt      TEXT,
+    summary          TEXT,
+    score            REAL,
+    matched_interest TEXT,
+    routed_as        TEXT,             -- 'urgent'|'digest'|'drop'|NULL (not yet routed)
+    fetched_at       TEXT NOT NULL,
+    pushed_at        TEXT,
+    digested_at      TEXT,
+    UNIQUE(source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_curated_fetched
+    ON curated_items(fetched_at DESC);
+CREATE INDEX IF NOT EXISTS idx_curated_routed
+    ON curated_items(routed_as, pushed_at, digested_at);
 """
 
 # Voyage `voyage-multimodal-3` returns 1024-dim float vectors.
@@ -178,6 +204,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_embeddings USING vec0(
     assistant_message_id INTEGER PRIMARY KEY,
     embedding float[{EMBEDDING_DIM}]
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS curated_item_vectors USING vec0(
+    item_id INTEGER PRIMARY KEY,
+    embedding float[{EMBEDDING_DIM}]
+);
 """
 
 HISTORY_LIMIT = 20
@@ -185,7 +215,7 @@ HISTORY_LIMIT = 20
 # Schema version — bump when a migration is added below, and gate the new step
 # on a `version < N` (or column-exists) check so re-runs are no-ops. Every step
 # must be idempotent.
-DB_USER_VERSION = 7
+DB_USER_VERSION = 9
 
 
 async def _column_exists(
@@ -249,6 +279,23 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_message_turns_visibility "
             "ON message_turns(chat_id, visibility)"
         )
+
+    # v8: curation pipeline tables created above via _SCHEMA (idempotent CREATE
+    # IF NOT EXISTS). No ALTER paths needed on upgrade — both tables are new.
+    # vec0 virtual tables are created by `_VEC_SCHEMA` post-extension-load,
+    # also idempotent. The version bump exists so a future v9 step that needs
+    # to ALTER one of these still has a clear migration anchor.
+    if version < 8:
+        # No-op marker. Schema applied via executescript above.
+        pass
+
+    # v9: drop the legacy interest_profile / interest_vectors tables. Scoring
+    # now uses an LLM-based market-impact rater (see runners/scorer.py) so the
+    # KNN-against-interests path is dead code. DROP IF EXISTS keeps it
+    # idempotent on fresh DBs that never had the tables.
+    if version < 9:
+        await db.execute("DROP TABLE IF EXISTS interest_vectors")
+        await db.execute("DROP TABLE IF EXISTS interest_profile")
 
     if version < DB_USER_VERSION:
         await db.execute(f"PRAGMA user_version = {DB_USER_VERSION}")
@@ -322,6 +369,29 @@ class ScheduledNudge:
     fire_at: str          # ISO 8601 UTC
     message: str
     created_at: str
+
+
+@dataclass(frozen=True)
+class CuratedItem:
+    """One row of `curated_items` materialized for callers.
+
+    `routed_as` / `pushed_at` / `digested_at` are `None` until the router /
+    pusher / digester touches them. `score` and `matched_interest` are None
+    until the scorer runs (e.g. while the row is still in summarize-pending).
+    """
+    id: int
+    source: str
+    external_id: str
+    url: str
+    title: str
+    raw_excerpt: str | None
+    summary: str | None
+    score: float | None
+    matched_interest: str | None
+    routed_as: str | None
+    fetched_at: str
+    pushed_at: str | None
+    digested_at: str | None
 
 
 @dataclass(frozen=True)
@@ -1097,6 +1167,196 @@ class SessionStore:
                     "errors": int(row[8] or 0),
                 }
             )
+        return out
+
+    # ---- curation pipeline (Phase 2.1) -----------------------------------
+
+    async def insert_curated_item(
+        self,
+        *,
+        source: str,
+        external_id: str,
+        url: str,
+        title: str,
+        raw_excerpt: str | None,
+        fetched_at: str,
+    ) -> int | None:
+        """Insert a freshly-fetched item. Returns the new id, or None if the
+        (source, external_id) pair is already present (dedup hit).
+        """
+        db = self._conn
+        async with self._write_lock:
+            try:
+                async with db.execute(
+                    """
+                    INSERT INTO curated_items
+                        (source, external_id, url, title, raw_excerpt, fetched_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (source, external_id, url, title, raw_excerpt, fetched_at),
+                ) as cur:
+                    new_id = cur.lastrowid
+                await db.commit()
+                return new_id
+            except aiosqlite.IntegrityError:
+                # UNIQUE(source, external_id) — dedup. Rollback the implicit
+                # transaction so the next write isn't poisoned.
+                await db.rollback()
+                return None
+
+    async def update_curated_summary_and_score(
+        self,
+        item_id: int,
+        *,
+        summary: str | None,
+        score: float | None,
+        matched_interest: str | None,
+        routed_as: str | None,
+    ) -> None:
+        """Patch summary/score/route after the pipeline scores it.
+
+        `routed_as` may be 'urgent', 'digest', or 'drop'. The pusher / digester
+        sets `pushed_at` / `digested_at` separately so a hot-loop retry doesn't
+        double-fire.
+        """
+        db = self._conn
+        async with self._write_lock:
+            await db.execute(
+                """
+                UPDATE curated_items
+                SET summary = ?, score = ?, matched_interest = ?, routed_as = ?
+                WHERE id = ?
+                """,
+                (summary, score, matched_interest, routed_as, item_id),
+            )
+            await db.commit()
+
+    async def record_curated_item_embedding(
+        self, item_id: int, embedding: list[float]
+    ) -> None:
+        """Store the embedding for a curated item (no-op if sqlite-vec absent)."""
+        if not self._has_vec:
+            return
+        try:
+            async with self._write_lock:
+                await self._conn.execute(
+                    "INSERT INTO curated_item_vectors (item_id, embedding) VALUES (?, ?)",
+                    (item_id, _pack_embedding(embedding)),
+                )
+                await self._conn.commit()
+        except Exception:
+            logger.exception("failed to store curated_item embedding id=%s", item_id)
+
+    async def mark_curated_pushed(self, item_id: int) -> None:
+        db = self._conn
+        async with self._write_lock:
+            await db.execute(
+                "UPDATE curated_items SET pushed_at = ? WHERE id = ? AND pushed_at IS NULL",
+                (_now_iso(), item_id),
+            )
+            await db.commit()
+
+    async def mark_curated_digested(self, item_ids: list[int]) -> None:
+        if not item_ids:
+            return
+        db = self._conn
+        now = _now_iso()
+        placeholders = ", ".join("?" for _ in item_ids)
+        async with self._write_lock:
+            await db.execute(
+                f"UPDATE curated_items SET digested_at = ? "
+                f"WHERE id IN ({placeholders}) AND digested_at IS NULL",
+                (now, *item_ids),
+            )
+            await db.commit()
+
+    async def list_pending_digest_items(
+        self, since_iso_utc: str
+    ) -> list[CuratedItem]:
+        """Return digest-routed items fetched since `since_iso_utc` that haven't
+        been included in a newsletter yet.
+        """
+        db = self._conn
+        async with db.execute(
+            """
+            SELECT id, source, external_id, url, title, raw_excerpt, summary,
+                   score, matched_interest, routed_as, fetched_at,
+                   pushed_at, digested_at
+            FROM curated_items
+            WHERE routed_as = 'digest'
+              AND digested_at IS NULL
+              AND fetched_at >= ?
+            ORDER BY score DESC, fetched_at DESC
+            """,
+            (since_iso_utc,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [CuratedItem(*row) for row in rows]
+
+    async def list_recent_curated_items(
+        self,
+        *,
+        since_iso_utc: str,
+        routed_as: str | None = None,
+        limit: int = 20,
+    ) -> list[CuratedItem]:
+        """Generic recent-items query for the in-conversation skill.
+
+        `routed_as=None` returns every route; otherwise filters to 'urgent',
+        'digest', or 'drop'.
+        """
+        db = self._conn
+        clauses = ["fetched_at >= ?"]
+        params: list[Any] = [since_iso_utc]
+        if routed_as is not None:
+            clauses.append("routed_as = ?")
+            params.append(routed_as)
+        params.append(int(max(1, min(limit, 100))))
+        sql = f"""
+            SELECT id, source, external_id, url, title, raw_excerpt, summary,
+                   score, matched_interest, routed_as, fetched_at,
+                   pushed_at, digested_at
+            FROM curated_items
+            WHERE {" AND ".join(clauses)}
+            ORDER BY fetched_at DESC, id DESC
+            LIMIT ?
+        """
+        async with db.execute(sql, tuple(params)) as cur:
+            rows = await cur.fetchall()
+        return [CuratedItem(*row) for row in rows]
+
+    async def search_curated_items_semantic(
+        self,
+        query_embedding: list[float],
+        *,
+        limit: int = 5,
+    ) -> list[tuple[CuratedItem, float]]:
+        """KNN over curated items by embedded title+summary.
+
+        Returns (item, distance) pairs ordered by distance ascending. Empty if
+        sqlite-vec isn't loaded or the index is empty.
+        """
+        if not self._has_vec:
+            return []
+        db = self._conn
+        packed = _pack_embedding(query_embedding)
+        async with db.execute(
+            f"""
+            SELECT c.id, c.source, c.external_id, c.url, c.title, c.raw_excerpt,
+                   c.summary, c.score, c.matched_interest, c.routed_as,
+                   c.fetched_at, c.pushed_at, c.digested_at, civ.distance
+            FROM curated_item_vectors civ
+            JOIN curated_items c ON c.id = civ.item_id
+            WHERE civ.embedding MATCH ? AND k = {int(limit)}
+            ORDER BY civ.distance
+            """,
+            (packed,),
+        ) as cur:
+            rows = await cur.fetchall()
+        out: list[tuple[CuratedItem, float]] = []
+        for row in rows:
+            item = CuratedItem(*row[:13])
+            out.append((item, float(row[13])))
         return out
 
     async def get_saved_file_by_relpath(self, relpath: str) -> SavedFile | None:

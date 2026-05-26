@@ -36,16 +36,31 @@ from yunam.scheduler import (
 )
 from yunam.sender import PTBSender
 from yunam.sessions import SessionStore
+from yunam.text_embedder import JinaTextEmbedder
 from yunam.mcp import (
     GCalMCPClient,
     StockMCPClient,
     build_gcal_mcp_skill,
     build_stock_mcp_skill,
 )
+from yunam.runners import run_curation_loop
+from yunam.runners.digester import Digester
+from yunam.runners.pusher import CurationPusher
+from yunam.runners.scorer import Scorer
+from yunam.runners.sources import (
+    FeedSource,
+    MoneyflowSource,
+    NaverNewsSource,
+    RssGenericSource,
+    TossInvestSource,
+    XPlaywrightSource,
+)
+from yunam.runners.summarizer import Summarizer
 from yunam.skills import (
     Skill,
     SkillRegistry,
     build_airquality_skill,
+    build_curation_skill,
     build_files_skill,
     build_memory_skill,
     build_obsidian_graph_skill,
@@ -59,6 +74,7 @@ from yunam.skills import (
 from yunam.subagents import build_deep_think_orchestrator
 from yunam.tools.airquality import AirQualityTools
 from yunam.tools.attachments import AttachmentTools
+from yunam.tools.curation import CurationTools
 from yunam.tools.memory import MemoryTools
 from yunam.tools.obsidian import ObsidianTools
 from yunam.tools.obsidian_graph import ObsidianGraphTools
@@ -71,6 +87,109 @@ from yunam.usage import UsageRecorder
 load_dotenv()
 configure_logging()
 logger = logging.getLogger("yunam.gateway")
+
+
+def _build_text_embedder(cfg, voyage_embedder, usage_recorder):
+    """Pick the text embedder based on `YUNAM_TEXT_EMBEDDER`.
+
+    `voyage` (default) returns the Voyage instance directly — full backward
+    compat with deployments that never set the var. `jina` returns a fresh
+    JinaTextEmbedder bound to the existing JINA_API_KEY. Anything else falls
+    back to voyage with a warning so a typo doesn't silently degrade memory.
+    """
+    provider = (cfg.text_embedder_provider or "voyage").lower()
+    if provider == "jina":
+        if not cfg.jina_api_key:
+            logger.warning(
+                "YUNAM_TEXT_EMBEDDER=jina but JINA_API_KEY is unset — "
+                "falling back to voyage. Set JINA_API_KEY and restart."
+            )
+            return voyage_embedder
+        return JinaTextEmbedder(
+            api_key=cfg.jina_api_key, usage_recorder=usage_recorder
+        )
+    if provider != "voyage":
+        logger.warning(
+            "unknown YUNAM_TEXT_EMBEDDER=%r; falling back to voyage",
+            provider,
+        )
+    return voyage_embedder
+
+
+def _build_curation_sources(
+    cfg,
+    stock_client,
+    usage_recorder: UsageRecorder,
+) -> list[FeedSource]:
+    """Assemble the source list from env. Missing credentials → source skipped.
+
+    Order is intentional and stable across restarts: Naver → RSS → Toss →
+    Moneyflow → X. The curator's fan-out doesn't depend on order (results are
+    unioned), but log lines + audit attribution are easier to read when it's
+    consistent.
+    """
+    sources: list[FeedSource] = []
+    if cfg.naver_client_id and cfg.naver_client_secret and cfg.naver_queries:
+        sources.append(
+            NaverNewsSource(
+                client_id=cfg.naver_client_id,
+                client_secret=cfg.naver_client_secret,
+                queries=cfg.naver_queries,
+                usage_recorder=usage_recorder,
+            )
+        )
+    # Tiered RSS sources. Three independent RssGenericSource instances with
+    # tier_divisor=1/2/4 produce a natural per-tick cadence: every tick fires
+    # tier_high; every 2nd fires tier_mid; every 4th fires tier_low. The
+    # legacy `YUNAM_CURATION_RSS_FEEDS` env var (no tier suffix) is treated as
+    # tier_high so older .env files keep working unchanged.
+    high_feeds = cfg.curation_rss_tier_high or cfg.curation_rss_feeds
+    if high_feeds:
+        sources.append(
+            RssGenericSource(
+                feeds=high_feeds,
+                usage_recorder=usage_recorder,
+                tier_divisor=1,
+                tier_label="rss-high",
+            )
+        )
+    if cfg.curation_rss_tier_mid:
+        sources.append(
+            RssGenericSource(
+                feeds=cfg.curation_rss_tier_mid,
+                usage_recorder=usage_recorder,
+                tier_divisor=2,
+                tier_label="rss-mid",
+            )
+        )
+    if cfg.curation_rss_tier_low:
+        sources.append(
+            RssGenericSource(
+                feeds=cfg.curation_rss_tier_low,
+                usage_recorder=usage_recorder,
+                tier_divisor=4,
+                tier_label="rss-low",
+            )
+        )
+    if cfg.toss_fetch_mode != "disabled":
+        sources.append(
+            TossInvestSource(
+                mode=cfg.toss_fetch_mode,
+                api_url=cfg.toss_news_url,
+                usage_recorder=usage_recorder,
+            )
+        )
+    if cfg.moneyflow_enabled and stock_client is not None:
+        sources.append(
+            MoneyflowSource(
+                stock_client, timezone_name=cfg.timezone, enabled=True
+            )
+        )
+    if cfg.x_enabled:
+        sources.append(
+            XPlaywrightSource(handles=cfg.x_handles, enabled=True)
+        )
+    return sources
 
 
 async def _run() -> None:
@@ -95,9 +214,23 @@ async def _run() -> None:
     usage_recorder = UsageRecorder(store)
     tools = ObsidianTools(cfg.vault_path)
     claude_client = anthropic.AsyncAnthropic(api_key=cfg.anthropic_api_key)
-    embedder = VoyageEmbedder(
+    voyage_embedder = VoyageEmbedder(
         api_key=cfg.voyage_api_key, usage_recorder=usage_recorder
     )
+    # `text_embedder` powers every text-only embedding path: memory recall,
+    # curation scoring / search, orchestrator turn embeddings. `voyage_embedder`
+    # stays available for AttachmentTools' multimodal (image) path — Jina v3
+    # doesn't accept images. When you've exhausted Voyage's free tier, set
+    # YUNAM_TEXT_EMBEDDER=jina and only multimodal file saves keep paying.
+    text_embedder = _build_text_embedder(cfg, voyage_embedder, usage_recorder)
+    logger.info(
+        "text embedder = %s (multimodal path stays on voyage)",
+        cfg.text_embedder_provider,
+    )
+    # Backwards compat alias — every consumer further down still reads
+    # `embedder`. With YUNAM_TEXT_EMBEDDER=voyage (default) this is the
+    # Voyage instance; with jina it's the JinaTextEmbedder.
+    embedder = text_embedder
 
     app = Application.builder().token(cfg.telegram_token).build()
     sender = PTBSender(app.bot)
@@ -106,7 +239,8 @@ async def _run() -> None:
         filevault_root=cfg.filevault_path,
         obsidian_root=cfg.vault_path,
         sender=sender,
-        embedder=embedder,
+        # AttachmentTools' image path needs multimodal — always Voyage.
+        embedder=voyage_embedder,
         vision_client=claude_client,
         timezone=cfg.timezone,
     )
@@ -130,6 +264,9 @@ async def _run() -> None:
         timezone_name=cfg.timezone,
         daily_alert_usd=cfg.cost_alert_daily_usd,
         monthly_alert_usd=cfg.cost_alert_monthly_usd,
+    )
+    curation_tools = CurationTools(
+        store=store, embedder=embedder, timezone_name=cfg.timezone
     )
 
     # Optional: connect to MCP sibling containers. If a URL is unset we skip
@@ -194,9 +331,12 @@ async def _run() -> None:
     skills.append(build_memory_skill(memory_tools))
     skills.append(build_obsidian_graph_skill(graph_tools))
     skills.append(build_privacy_skill())
-    # Usage skill last — appending after `privacy` preserves the existing
+    # Usage skill — appending after `privacy` preserves the existing
     # prompt-cache prefix and only adds its own fragment + tools at the tail.
     skills.append(build_usage_skill(usage_tools))
+    # Curation skill (Phase 2.1) — last in the registry. Read/admin surface
+    # only; the background runner does the real work outside the tool surface.
+    skills.append(build_curation_skill(curation_tools))
     registry = SkillRegistry(skills)
     orch = Orchestrator(
         claude_client, store, registry,
@@ -289,6 +429,48 @@ async def _run() -> None:
             ))
         else:
             logger.info("nudge sweeper disabled (YUNAM_NUDGE_SWEEPER_ENABLED is not set)")
+
+        if cfg.curation_enabled:
+            curation_sources = _build_curation_sources(
+                cfg, stock_client, usage_recorder
+            )
+            if not curation_sources:
+                logger.warning(
+                    "curation enabled but no sources configured "
+                    "(set NAVER_CLIENT_ID/SECRET, RSS feeds, or moneyflow); "
+                    "runner will tick but fetch nothing"
+                )
+            curation_summarizer = Summarizer(
+                claude_client, usage_recorder=usage_recorder
+            )
+            curation_scorer = Scorer(
+                claude_client, embedder, usage_recorder=usage_recorder
+            )
+            curation_pusher = CurationPusher(
+                app.bot, store, owner_chat_id=cfg.owner.user_id
+            )
+            curation_digester = Digester(store)
+            scheduler_tasks.append(asyncio.create_task(
+                run_curation_loop(
+                    cfg=cfg,
+                    store=store,
+                    sources=curation_sources,
+                    summarizer=curation_summarizer,
+                    scorer=curation_scorer,
+                    pusher=curation_pusher,
+                    digester=curation_digester,
+                    stop_event=stop_event,
+                ),
+                name="yunam-curation-loop",
+            ))
+            logger.info(
+                "curation runner started interval=%dmin newsletter_time=%s sources=%s",
+                cfg.curation_interval_minutes,
+                cfg.curation_newsletter_time,
+                [s.name for s in curation_sources],
+            )
+        else:
+            logger.info("curation runner disabled (YUNAM_CURATION_ENABLED is not set)")
 
         await stop_event.wait()
     finally:

@@ -4,7 +4,7 @@
 Exercises the full pipeline against a temporary SQLite database — no Anthropic,
 no network. Verifies:
 
-  1. SessionStore migrates to user_version=7 and the `api_usage` table exists.
+  1. SessionStore migrates to user_version=DB_USER_VERSION and the `api_usage` table exists.
   2. UsageRecorder.record_anthropic / record_voyage / record_rest / record_mcp
      all land rows on the table after `flush()`.
   3. UsageTools.summary / breakdown / cost_alert_status produce sensible text.
@@ -63,10 +63,12 @@ async def _check_pipeline() -> None:
         db_path = Path(tmp) / "yunam.db"
         store = await SessionStore.open(db_path)
         try:
-            # PRAGMA bumped to v7?
+            # PRAGMA bumped to current DB_USER_VERSION?
             async with store._conn.execute("PRAGMA user_version") as cur:  # type: ignore[attr-defined]
                 row = await cur.fetchone()
-            assert row[0] == DB_USER_VERSION == 7, f"user_version {row[0]} != 7"
+            assert row[0] == DB_USER_VERSION, (
+                f"user_version {row[0]} != DB_USER_VERSION {DB_USER_VERSION}"
+            )
 
             # `api_usage` exists?
             async with store._conn.execute(  # type: ignore[attr-defined]
@@ -74,7 +76,7 @@ async def _check_pipeline() -> None:
             ) as cur:
                 row = await cur.fetchone()
             assert row is not None, "api_usage table missing after migration"
-            print("    schema OK (user_version=7, api_usage present)")
+            print(f"    schema OK (user_version={DB_USER_VERSION}, api_usage present)")
 
             recorder = UsageRecorder(store)
 
