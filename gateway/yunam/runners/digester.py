@@ -1,16 +1,22 @@
-"""Daily 21:00 newsletter builder.
+"""Daily newsletter builder.
 
-Reads every digest-routed item fetched since the previous newsletter, groups
-them by `matched_interest`, formats a single Telegram-friendly message, marks
-them digested, and returns the rendered text. The caller pushes via PTBSender.
+Reads every digest-routed item fetched since the previous newsletter, picks
+the top-N by score within each category, and lays them out in a compact
+Telegram-friendly format.
 
-We don't ask Claude to rewrite the bundle — the per-item Haiku summaries are
-already there, and rewriting them would (a) cost more tokens and (b) lose
-the source attribution we want to preserve. Just lay them out.
-
-Format: each item is a single-line bullet (number + title + em-dash + one-line
-summary). URLs are grouped at the end in a flat numbered list so the body stays
-scannable.
+Design rules (don't drift from these without a reason):
+  - One line per item: "• title (url)". Telegram will auto-unfurl ONLY the
+    first URL in the message, so we don't get N preview cards. The title
+    is what the user reads; the URL is the click target.
+  - No per-item summary line. The Haiku summary is duplicative once you've
+    got the article title + Telegram preview card. Skipping it cuts the
+    message length ~3x and removes the "..." truncations the user
+    complained about.
+  - No separate "🔗 링크" block at the bottom. URLs are inline; the block
+    just bloated the message.
+  - Cap at TOTAL_CAP items overall, PER_SECTION_CAP per category. Items
+    are sorted by score within a section so the strongest signals win the
+    finite slot budget.
 """
 
 from __future__ import annotations
@@ -18,15 +24,14 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
 
 from ..sessions import CuratedItem, SessionStore
 
 logger = logging.getLogger("yunam.runners.digester")
 
-MAX_ITEMS_PER_SECTION = 6
-MAX_ITEMS_TOTAL = 25
-SUMMARY_LINE_CAP = 90
+PER_SECTION_CAP = 4
+TOTAL_CAP = 15
+TITLE_CAP = 120
 
 
 class Digester:
@@ -36,11 +41,7 @@ class Digester:
     async def build_newsletter(
         self, *, lookback_hours: int = 24
     ) -> tuple[str, list[int]]:
-        """Render the newsletter and return (text, item_ids_consumed).
-
-        Caller sends the text via PTBSender, then calls
-        `store.mark_curated_digested(item_ids)` after a successful send.
-        """
+        """Render the newsletter and return (text, item_ids_consumed)."""
         since = (
             datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
         ).isoformat()
@@ -48,41 +49,54 @@ class Digester:
         if not items:
             return "", []
 
-        capped = items[:MAX_ITEMS_TOTAL]
-
+        # list_pending_digest_items already orders by score DESC. Bucket by
+        # category, keep the top PER_SECTION_CAP within each, then take the
+        # leading TOTAL_CAP across sections.
         grouped: dict[str, list[CuratedItem]] = defaultdict(list)
-        for item in capped:
-            label = item.matched_interest or "기타"
-            grouped[label].append(item)
+        for item in items:
+            label = (item.matched_interest or "기타").strip()
+            if len(grouped[label]) < PER_SECTION_CAP:
+                grouped[label].append(item)
 
-        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        header = f"📰 오늘({date_str}) 뉴스레터 — {len(items)}건"
+        selected: list[CuratedItem] = []
+        for label in sorted(grouped.keys()):
+            for it in grouped[label]:
+                selected.append(it)
+                if len(selected) >= TOTAL_CAP:
+                    break
+            if len(selected) >= TOTAL_CAP:
+                break
+
+        # Re-bucket the kept items so section ordering matches selection.
+        kept: dict[str, list[CuratedItem]] = defaultdict(list)
+        for it in selected:
+            kept[(it.matched_interest or "기타").strip()].append(it)
+
+        date_str = datetime.now(timezone.utc).strftime("%m/%d")
+        header = f"📰 {date_str} 뉴스 다이제스트 ({len(selected)}건)"
 
         sections: list[str] = []
-        link_lines: list[str] = []
         consumed: list[int] = []
-        counter = 0
-        for label in sorted(grouped.keys()):
-            section_items = grouped[label][:MAX_ITEMS_PER_SECTION]
-            lines = [f"[{label}]"]
-            for item in section_items:
-                counter += 1
-                lines.append(_format_bullet(counter, item))
-                link_lines.append(f"{counter}. {item.url}")
+        for label in sorted(kept.keys()):
+            lines = [f"<{label}>"]
+            for item in kept[label]:
+                lines.append(_format_bullet(item))
                 consumed.append(int(item.id))
             sections.append("\n".join(lines))
 
         body = "\n\n".join(sections)
-        links_block = "🔗 링크\n" + "\n".join(link_lines)
-        text = f"{header}\n\n{body}\n\n────────\n{links_block}"
+        text = f"{header}\n\n{body}"
         return text, consumed
 
 
-def _format_bullet(index: int, item: CuratedItem) -> str:
-    title = item.title.strip()
-    summary = (item.summary or "").strip().replace("\n", " ")
-    if len(summary) > SUMMARY_LINE_CAP:
-        summary = summary[: SUMMARY_LINE_CAP - 1] + "…"
-    if summary:
-        return f"{index}. {title} — {summary}"
-    return f"{index}. {title}"
+def _format_bullet(item: CuratedItem) -> str:
+    """One-liner per item: `• title  url`.
+
+    Telegram-friendly: single line so the message stays scannable; URL
+    is the only click target. Title is hard-trimmed to TITLE_CAP so a
+    single ranty headline can't push everything else off-screen.
+    """
+    title = (item.title or "").strip().replace("\n", " ")
+    if len(title) > TITLE_CAP:
+        title = title[: TITLE_CAP - 1] + "…"
+    return f"• {title}\n  {item.url}"

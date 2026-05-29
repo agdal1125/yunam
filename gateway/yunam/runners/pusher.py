@@ -66,15 +66,19 @@ class CurationPusher:
         return True
 
 
-URGENT_SUMMARY_CAP = 120
+TITLE_CAP = 140
 
 
 def _format_urgent(item: CuratedItem) -> str:
-    label = item.matched_interest or "긴급"
-    summary = (item.summary or "").strip().replace("\n", " ")
-    if len(summary) > URGENT_SUMMARY_CAP:
-        summary = summary[: URGENT_SUMMARY_CAP - 1] + "…"
-    head = f"🚨 [{label}] {item.title}"
-    if summary:
-        head += f" — {summary}"
-    return f"{head}\n\n{item.url}"
+    """Compact urgent push: category tag + title + URL.
+
+    Telegram auto-unfurls the URL into a preview card with the article
+    headline + lede + image, so duplicating the body inline just produces
+    mid-sentence truncations like the user complained about. Keep the
+    message itself one short line + the URL.
+    """
+    label = (item.matched_interest or "긴급").strip()
+    title = (item.title or "").strip().replace("\n", " ")
+    if len(title) > TITLE_CAP:
+        title = title[: TITLE_CAP - 1] + "…"
+    return f"🚨 [{label}] {title}\n{item.url}"

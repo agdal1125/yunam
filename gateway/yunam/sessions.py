@@ -428,17 +428,16 @@ class SessionStore:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = cls(db_path)
         store._db = await aiosqlite.connect(str(db_path))
-        await _migrate(store._db)
-        # Load sqlite-vec for the semantic file-search virtual table. Requires
-        # a Python build with `enable_load_extension` — standard on the Debian
-        # base image we run under Docker. Graceful fallback if unavailable
-        # (e.g. macOS Python without extension support) — semantic file search
-        # is disabled but everything else works.
+        # Load sqlite-vec BEFORE migration: the v9 step drops the legacy
+        # `interest_vectors` vec0 virtual table, and SQLite needs the vec0
+        # module loaded even to satisfy `DROP TABLE IF EXISTS` against it.
+        # Graceful fallback if the extension is unavailable (e.g. macOS Python
+        # without extension support) — semantic file search is disabled but
+        # everything else works.
         try:
             await store._db.enable_load_extension(True)
             await store._db.load_extension(sqlite_vec.loadable_path())
             await store._db.enable_load_extension(False)
-            await store._db.executescript(_VEC_SCHEMA)
             store._has_vec = True
             logger.info("sqlite-vec loaded; semantic file search enabled")
         except Exception as e:
@@ -446,6 +445,9 @@ class SessionStore:
                 "sqlite-vec not loaded (%s); semantic file search disabled", e
             )
             store._has_vec = False
+        await _migrate(store._db)
+        if store._has_vec:
+            await store._db.executescript(_VEC_SCHEMA)
         await store._db.commit()
         return store
 
@@ -1247,6 +1249,34 @@ class SessionStore:
         except Exception:
             logger.exception("failed to store curated_item embedding id=%s", item_id)
 
+    async def set_curated_routed_as(self, item_id: int, routed_as: str) -> None:
+        """Re-route an already-scored item without touching summary/score.
+
+        Used by the curator's rate-limit path: an item routed as urgent that
+        exceeds the per-tick or daily cap gets bumped to 'digest' so it
+        still surfaces in the newsletter without firing a Telegram alert.
+        """
+        db = self._conn
+        async with self._write_lock:
+            await db.execute(
+                "UPDATE curated_items SET routed_as = ? WHERE id = ?",
+                (routed_as, item_id),
+            )
+            await db.commit()
+
+    async def count_urgent_pushes_since(self, since_iso_utc: str) -> int:
+        """How many curated_items have a `pushed_at >= since`. Used by the
+        curator to enforce a daily urgent-push ceiling so a single noisy news
+        cycle can't blast the user with dozens of Telegram alerts."""
+        db = self._conn
+        async with db.execute(
+            "SELECT COUNT(*) FROM curated_items WHERE pushed_at IS NOT NULL "
+            "AND pushed_at >= ?",
+            (since_iso_utc,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
     async def mark_curated_pushed(self, item_id: int) -> None:
         db = self._conn
         async with self._write_lock:
@@ -1324,6 +1354,52 @@ class SessionStore:
         async with db.execute(sql, tuple(params)) as cur:
             rows = await cur.fetchall()
         return [CuratedItem(*row) for row in rows]
+
+    async def find_recent_curated_dupe(
+        self,
+        query_embedding: list[float],
+        *,
+        since_iso_utc: str,
+        max_distance: float,
+        exclude_id: int | None = None,
+    ) -> tuple[int, str, float] | None:
+        """Return (item_id, title, distance) of the closest recent curated
+        item whose vec0 distance is below `max_distance`, or None.
+
+        Used by the curator to suppress duplicate stories arriving from
+        different sources within a short window. sqlite-vec returns L2
+        distance on unit-normalized vectors — for Voyage embeddings a
+        cutoff around 0.4–0.5 corresponds to "same story, different
+        wording" (cosine similarity > ~0.9).
+        """
+        if not self._has_vec:
+            return None
+        db = self._conn
+        packed = _pack_embedding(query_embedding)
+        # Over-fetch a few neighbors so the time-window filter still leaves
+        # us at least one candidate when the closest neighbor is too old.
+        async with db.execute(
+            """
+            SELECT c.id, c.title, c.fetched_at, civ.distance
+            FROM curated_item_vectors civ
+            JOIN curated_items c ON c.id = civ.item_id
+            WHERE civ.embedding MATCH ? AND k = 5
+            ORDER BY civ.distance
+            """,
+            (packed,),
+        ) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            item_id, title, fetched_at, distance = row
+            if exclude_id is not None and int(item_id) == int(exclude_id):
+                continue
+            if fetched_at < since_iso_utc:
+                continue
+            if float(distance) > max_distance:
+                # Rows are distance-ordered; anything past here is farther.
+                return None
+            return int(item_id), str(title), float(distance)
+        return None
 
     async def search_curated_items_semantic(
         self,

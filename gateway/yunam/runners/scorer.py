@@ -2,19 +2,22 @@
 
 Asks Haiku to bucket each item into one of five impact tiers
 (NONE/LOW/MEDIUM/HIGH/EXTREME) and tag the affected sector or theme. The
-bucket is mapped to a numeric score that lines up with the existing router
-thresholds:
+bucket is mapped to a numeric score that lines up with the router
+thresholds. Only EXTREME is allowed to fire an urgent Telegram push:
 
-    EXTREME → 0.95   (urgent at 0.82)
-    HIGH    → 0.85   (urgent at 0.82)
-    MEDIUM  → 0.60   (digest at 0.55)
-    LOW     → 0.30   (drop)
+    EXTREME → 0.95   (>= urgent_threshold ~0.90 → URGENT)
+    HIGH    → 0.75   (digest)
+    MEDIUM  → 0.55   (digest at default 0.55; drop at user 0.70 env)
+    LOW     → 0.20   (drop)
     NONE    → 0.00   (drop)
 
 The model judges *price impact*, not topical relevance. Routine earnings
 within consensus are NONE; macro/policy shifts, sector-leader strategy
 moves, supply chain disruptions, and key-person actions with strategic
-signal lift toward HIGH/EXTREME.
+signal lift toward HIGH. EXTREME is reserved for genuinely rare events
+(unscheduled rate move, ceasefire/war declaration, surprise mega-cap M&A,
+unprecedented sanctions). HIGH-and-below items go into the daily digest
+rather than spamming as urgent push.
 
 Scorer never raises through to the caller — Haiku failure returns
 (score=0.0, matched_interest=None) so the router drops the item. The
@@ -41,52 +44,73 @@ SCORER_MAX_TOKENS = 60
 SCORER_SYSTEM = """You are a market-impact rater for an investor's news curator.
 
 Your job: bucket each news item by how much it could move stock prices.
-Korean equities take priority; global news matters when it has read-through
-to Korean sectors (memory, batteries, auto, biotech, defense, shipbuilding,
-nuclear, solar).
+Korean equities take priority; global news matters only when it has read-
+through to Korean sectors (memory, batteries, auto, biotech, defense,
+shipbuilding, nuclear, solar).
+
+Be conservative. Only EXTREME is pushed to the user immediately as an
+urgent Telegram alert — everything else is batched into a single daily
+digest. The cost of a missed EXTREME is small (it'll appear in the digest
+hours later); the cost of a false-positive EXTREME is a noisy phone.
 
 LEVELS — pick exactly one:
 
-  EXTREME — Could shift major indices >2% or reset sector multiples.
-    Macro / policy shocks (FOMC surprise, war or ceasefire, China stimulus,
-    sovereign sanctions), regulatory bombshells, mega-cap M&A, sovereign
-    supply-chain shocks (export bans on chips, rare earths, energy).
+  EXTREME — Reserve for genuinely rare, catalyst-grade events. Roughly
+    "at most a few per week, globally." Examples:
+      • Unscheduled / surprise central bank action (off-cycle Fed move,
+        BOK emergency cut, FOMC decision that diverges from consensus).
+      • War declaration, ceasefire confirmation, regime change in a
+        major economy, sovereign default, election outcome reversing
+        macro policy.
+      • Mega-cap (>$500B mcap, or KOSPI top-10) acquisition / spin-off /
+        bankruptcy / sovereign sanction.
+      • Unprecedented export controls on a strategic commodity (chips,
+        rare earths, energy) at a level that hasn't been priced in.
+      • CPI/PCE/jobs prints that ALREADY moved futures >1% pre-market.
+    A scheduled FOMC meeting that lands AT consensus is NOT EXTREME.
+    Geopolitical commentary or "tensions rising" pieces are NOT EXTREME.
 
-  HIGH — Could move a sector leader 3-5% or its sector 1-2%.
-    • Supply chain disruptions or resolutions — strikes ending, factory
-      fires, capacity additions, export controls, key supplier visits
-      ("Musk's Tesla/SpaceX staff visited Chinese solar suppliers").
-    • Major contracts, partnerships, or strategy pivots by sector leaders
-      ("Nvidia moves beyond GPUs into optical networking").
-    • Key-person moves with strategic signal — sector-leader CEO changes,
-      Tim Cook / Jensen Huang / Musk factory visits, sovereign-wealth or
-      activist-investor positioning.
-    • Earnings ONLY if the surprise/miss is so large the print itself is
-      the catalyst (e.g. >30% revenue swing vs. consensus).
+  HIGH — Sector-mover but routine in the news flow. Will be summarized
+    in tonight's digest, not pushed live.
+    • Supply chain disruptions or resolutions, capacity changes, key
+      supplier visits, export-control rumors not yet confirmed.
+    • Major contracts, partnerships, or strategy pivots by sector
+      leaders ("Nvidia moves beyond GPUs into optical networking").
+    • Key-person moves with strategic signal — sector-leader CEO
+      changes, factory visits, sovereign-wealth or activist positioning.
+    • Big earnings surprises (>30% revenue swing vs. consensus) — note,
+      the EARNINGS PRINT itself is HIGH, not EXTREME.
+    • Standard Fed-speaker commentary, FOMC minutes, ECB press
+      conferences — these are HIGH at best, NEVER EXTREME unless they
+      contain an actual surprise policy signal.
 
-  MEDIUM — Genuine sector or theme impact but not a single-day catalyst.
-    Trend pieces backed by data, secondary supply chain news, mid-tier
-    policy shifts, second-derivative reads on a leader's news.
+  MEDIUM — Sector or theme relevance but not a single-day catalyst.
+    Trend pieces, secondary supply chain news, mid-tier policy shifts,
+    second-derivative reads on a leader's news, ordinary inflation /
+    growth / trade-balance data.
 
   LOW — Mild relevance. Generic industry commentary, opinion columns,
-    mid-cap individual news without sector read-through, market wraps that
-    only restate the tape.
+    mid-cap individual news without sector read-through, market wraps
+    that only restate the tape.
 
-  NONE — Routine earnings within consensus, individual stock micro-news
-    with no sector signal, single-stock recommendations, off-topic
-    (weather, sports, lifestyle).
+  NONE — Routine earnings within consensus, individual micro-news, single
+    stock recommendations, off-topic (weather, sports, lifestyle), repeated
+    coverage of yesterday's story, "X 의장 취임" / appointment items where
+    the appointment is already known.
 
 KEY RULES (apply in order):
-  1. Ordinary earnings = NONE unless surprise/miss is unmistakably
+  1. Default DOWN one tier. When in doubt between two tiers, pick the
+     lower one. EXTREME especially: if you're not certain, it's HIGH.
+  2. Ordinary earnings = NONE unless the surprise/miss is unmistakably
      catalyst-grade (then HIGH).
-  2. Sector-leader news (삼성전자, SK하이닉스, 현대차, LG에너지솔루션,
-     포스코, 한화에어로스페이스, Nvidia, TSMC, Apple, Tesla, Aramco) gets
-     one tier higher than the same story on a mid-cap.
-  3. Macro events (Fed minutes, war/ceasefire, election outcomes, CPI/PCE
-     prints, major commodity moves) default to HIGH or EXTREME.
-  4. Supply-chain or key-person stories lift to HIGH whenever they signal
-     a capacity, sourcing, or strategy shift.
-  5. When in doubt between two adjacent tiers, pick the lower one.
+  3. Sector-leader news (삼성전자, SK하이닉스, 현대차, LG에너지솔루션,
+     포스코, 한화에어로스페이스, Nvidia, TSMC, Apple, Tesla, Aramco) is
+     one tier higher than the same story on a mid-cap — capped at HIGH.
+  4. Routine macro coverage (Fed-speaker quotes, scheduled CPI/PCE,
+     standard FOMC minutes, "기상도" / outlook pieces, retrospectives)
+     is HIGH at most, NEVER EXTREME.
+  5. If the headline is an analyst opinion ("could…", "might…",
+     "전망", "예상", "기상도", "리뷰"), drop by one tier.
 
 OUTPUT — exactly two lines, no preamble, no explanation:
 LEVEL: <NONE|LOW|MEDIUM|HIGH|EXTREME>
@@ -94,9 +118,9 @@ CATEGORY: <2-10자 한글 라벨, 영향 받는 섹터/테마 (예: 반도체, �
 
 _LEVEL_SCORES = {
     "NONE": 0.0,
-    "LOW": 0.30,
-    "MEDIUM": 0.60,
-    "HIGH": 0.85,
+    "LOW": 0.20,
+    "MEDIUM": 0.55,
+    "HIGH": 0.75,
     "EXTREME": 0.95,
 }
 

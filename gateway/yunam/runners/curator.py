@@ -19,13 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 from ..config import Config
-from ..sessions import SessionStore
+from ..sessions import CuratedItem, SessionStore
 from ..usage import reset_skill_context, set_skill_context
 from .digester import Digester
 from .pusher import CurationPusher
@@ -35,6 +36,39 @@ from .sources.base import CuratedCandidate, FeedSource
 from .summarizer import Summarizer
 
 logger = logging.getLogger("yunam.runners.curator")
+
+# Hard caps so the urgent channel stays "phone-vibrates-worth-it" signal.
+# Anything past these caps gets demoted to the daily digest.
+URGENT_PUSHES_PER_TICK = 1
+URGENT_PUSHES_PER_DAY = 5
+
+# Two-layer dedup keeps the same story from filling the digest:
+#   1. Within a tick we drop candidates whose normalized title is an exact
+#      duplicate of one we've already seen in this tick (e.g. an RSS feed
+#      and a Naver search both return the same wire headline).
+#   2. Across ticks we use the curated_item_vectors KNN index to detect
+#      paraphrases — same event, different wording, different source —
+#      within DEDUPE_LOOKBACK_HOURS. Threshold is L2 distance on unit-
+#      normalized Voyage embeddings; ~0.45 ≈ cosine 0.90.
+DEDUPE_LOOKBACK_HOURS = 12
+DEDUPE_MAX_DISTANCE = 0.45
+
+_TITLE_NORMALIZE_STRIP = re.compile(r"[\[\(][^\]\)]*[\]\)]")
+_TITLE_NORMALIZE_NONWORD = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _normalize_title(title: str) -> str:
+    """Cheap normalization for within-tick exact-dup detection.
+
+    Strips wrapper brackets ('[연준]', '(시사)'), then drops every non-word
+    character. Returns lowercase. Two titles colliding here means the wire
+    headline is byte-identical modulo formatting — a reliable dup signal.
+    """
+    if not title:
+        return ""
+    t = _TITLE_NORMALIZE_STRIP.sub("", title)
+    t = _TITLE_NORMALIZE_NONWORD.sub("", t)
+    return t.lower()
 
 
 async def run_curation_loop(
@@ -167,9 +201,35 @@ async def _run_one_tick(
         return
 
     now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "+00:00"
-    routed_counts = {"urgent": 0, "digest": 0, "drop": 0, "dedup": 0, "error": 0}
+    routed_counts = {
+        "urgent": 0, "digest": 0, "drop": 0, "dedup": 0,
+        "title_dedup": 0, "semantic_dedup": 0, "error": 0,
+    }
 
+    # Within-tick title dedup — collapse exact-normalized title collisions
+    # before we spend tokens on summarize/score. Order-preserving so the
+    # first source that surfaced the story wins (typically the more
+    # authoritative wire).
+    deduped: list[CuratedCandidate] = []
+    seen_titles: set[str] = set()
     for candidate in candidates:
+        key = _normalize_title(candidate.title)
+        if key and key in seen_titles:
+            routed_counts["title_dedup"] += 1
+            continue
+        if key:
+            seen_titles.add(key)
+        deduped.append(candidate)
+
+    # Collect urgent-routed items here instead of pushing inline. After the
+    # whole tick is scored we take the top-N by score (subject to the daily
+    # cap) and demote the rest to digest — keeps the urgent channel scarce
+    # even when a news cycle floods us with EXTREME-rated items.
+    urgent_candidates: list[tuple[int, float]] = []
+
+    dedupe_since = _hours_ago_iso(DEDUPE_LOOKBACK_HOURS)
+
+    for candidate in deduped:
         item_id = await store.insert_curated_item(
             source=candidate.source,
             external_id=candidate.external_id,
@@ -187,17 +247,26 @@ async def _run_one_tick(
                 candidate=candidate,
                 summarizer=summarizer,
                 scorer=scorer,
-                pusher=pusher,
                 store=store,
                 urgent_threshold=urgent_threshold,
                 digest_threshold=digest_threshold,
                 routed_counts=routed_counts,
+                urgent_candidates=urgent_candidates,
+                dedupe_since=dedupe_since,
             )
         except Exception:
             routed_counts["error"] += 1
             logger.exception(
                 "curation: per-item processing failed item_id=%s", item_id
             )
+
+    pushed, demoted = await _dispatch_urgents(
+        urgent_candidates=urgent_candidates,
+        store=store,
+        pusher=pusher,
+    )
+    routed_counts["urgent_pushed"] = pushed
+    routed_counts["urgent_demoted"] = demoted
 
     logger.info(
         "curation tick: fetched_per_source=%s routed=%s elapsed=%.1fs",
@@ -221,11 +290,12 @@ async def _process_one(
     candidate: CuratedCandidate,
     summarizer: Summarizer,
     scorer: Scorer,
-    pusher: CurationPusher,
     store: SessionStore,
     urgent_threshold: float,
     digest_threshold: float,
     routed_counts: dict[str, int],
+    urgent_candidates: list[tuple[int, float]],
+    dedupe_since: str,
 ) -> None:
     summary = await summarizer.summarize(
         title=candidate.title, raw_excerpt=candidate.raw_excerpt
@@ -234,11 +304,36 @@ async def _process_one(
         title=candidate.title,
         summary_or_excerpt=summary or candidate.raw_excerpt,
     )
+
+    # Semantic dedup — if a near-identical story landed in the last
+    # DEDUPE_LOOKBACK_HOURS, drop this one instead of routing it. We still
+    # record the summary/score (it's audit) and the embedding (so later
+    # ticks can detect chains of paraphrases), we just downgrade the route.
     decision = route(
         score=score_result.score,
         urgent_threshold=urgent_threshold,
         digest_threshold=digest_threshold,
     )
+    dupe = None
+    if (
+        score_result.embedding is not None
+        and decision in (URGENT, DIGEST)
+    ):
+        dupe = await store.find_recent_curated_dupe(
+            score_result.embedding,
+            since_iso_utc=dedupe_since,
+            max_distance=DEDUPE_MAX_DISTANCE,
+            exclude_id=int(item_id),
+        )
+    if dupe is not None:
+        dup_id, dup_title, distance = dupe
+        logger.info(
+            "semantic dedup: item_id=%s '%.60s' ≈ id=%s '%.60s' (d=%.3f) → drop",
+            item_id, candidate.title or "", dup_id, dup_title, distance,
+        )
+        decision = DROP
+        routed_counts["semantic_dedup"] += 1
+
     await store.update_curated_summary_and_score(
         item_id,
         summary=summary,
@@ -250,18 +345,80 @@ async def _process_one(
         await store.record_curated_item_embedding(item_id, score_result.embedding)
     routed_counts[decision] += 1
     if decision == URGENT:
-        # Refetch the row to get the populated summary/score for the push body.
-        items = await store.list_recent_curated_items(
-            since_iso_utc=_one_hour_ago_iso(), routed_as=URGENT, limit=20
+        urgent_candidates.append((int(item_id), float(score_result.score)))
+
+
+async def _dispatch_urgents(
+    *,
+    urgent_candidates: list[tuple[int, float]],
+    store: SessionStore,
+    pusher: CurationPusher,
+) -> tuple[int, int]:
+    """Send up to N urgent pushes per tick, capped daily; demote the rest.
+
+    Returns (pushed_count, demoted_count). The demoted items keep their
+    summary/score but get re-routed to 'digest' so the daily newsletter
+    picks them up.
+    """
+    if not urgent_candidates:
+        return 0, 0
+    # Highest-score first — if a single tick has multiple EXTREME items we
+    # want the most impactful one to be the one that fires.
+    urgent_candidates.sort(key=lambda t: t[1], reverse=True)
+
+    day_start = _utc_day_start_iso()
+    pushed_today = await store.count_urgent_pushes_since(day_start)
+    remaining_today = max(0, URGENT_PUSHES_PER_DAY - pushed_today)
+    slots = min(URGENT_PUSHES_PER_TICK, remaining_today)
+
+    pushed = 0
+    demoted: list[int] = []
+    one_hour_ago = _one_hour_ago_iso()
+    for item_id, _score in urgent_candidates:
+        if slots <= 0:
+            demoted.append(item_id)
+            continue
+        # Refetch so the push body has the populated summary/score/category.
+        recent = await store.list_recent_curated_items(
+            since_iso_utc=one_hour_ago, routed_as=URGENT, limit=50
         )
-        # Find our just-routed row by id.
-        match = next((it for it in items if int(it.id) == int(item_id)), None)
-        if match is not None and match.pushed_at is None:
-            await pusher.push_urgent(match)
+        match = next((it for it in recent if int(it.id) == int(item_id)), None)
+        if match is None or match.pushed_at is not None:
+            continue
+        ok = await pusher.push_urgent(match)
+        if ok:
+            pushed += 1
+            slots -= 1
+        else:
+            # Treat send failure as a demote so the item still shows up in
+            # the digest rather than getting silently dropped.
+            demoted.append(item_id)
+
+    for item_id in demoted:
+        try:
+            await store.set_curated_routed_as(item_id, DIGEST)
+        except Exception:
+            logger.exception("urgent-demote failed item_id=%s", item_id)
+    if demoted:
+        logger.info(
+            "urgent cap: demoted %d items to digest (pushed=%d, daily_pushed=%d/%d)",
+            len(demoted), pushed, pushed_today + pushed, URGENT_PUSHES_PER_DAY,
+        )
+    return pushed, len(demoted)
 
 
 def _one_hour_ago_iso() -> str:
     return (datetime.utcnow() - timedelta(hours=1)).isoformat() + "+00:00"
+
+
+def _hours_ago_iso(hours: int) -> str:
+    return (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "+00:00"
+
+
+def _utc_day_start_iso() -> str:
+    now = datetime.utcnow()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start.isoformat() + "+00:00"
 
 
 # ---- newsletter loop ------------------------------------------------------
